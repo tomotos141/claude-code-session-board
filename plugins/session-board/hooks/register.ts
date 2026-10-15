@@ -91,142 +91,38 @@ export const resetBootstrapForTests = (): void => {
 const answered = (r: { result?: unknown; isError?: boolean; deny?: string }): boolean =>
   r.deny === undefined && r.isError !== true && r.result !== undefined
 
-const STORE_KEY = 'bootstrap.created'
-const canonical = (s: string): string => s.normalize('NFC').trim()
-
-// The record is a JSON file of the mod's own that the person can open and hand-edit, so it is validated
-// rather than cast: a bare string would otherwise become a Set of its characters, and a number or an object
-// would throw on `new Set`, out through the swallowed catch, killing the bootstrap with no trace at all.
-// Anything malformed is read as no record, which falls back to not resuming, the safe answer.
-const recorded = async ($: Pick<EngineInterface, 'store' | 'ui'>): Promise<ReadonlySet<string>> => {
-  const raw: unknown = await $.store.get(STORE_KEY)
-  if (raw === undefined) return new Set()
-  if (!Array.isArray(raw)) {
-    say($, 'the record of what it made was not readable; ignoring it')
-    return new Set()
-  }
-  return new Set(raw.filter((v): v is string => typeof v === 'string').map(canonical))
-}
-
-// Normalised and deduplicated on the way in, so the record and the sidebar's listing are always compared
-// through the same spelling, and a section created again across stalled runs is written down once.
-const remember = ($: Pick<EngineInterface, 'store'>, names: readonly string[]): Promise<void> =>
-  $.store.set(STORE_KEY, [...new Set(names.map(canonical))])
-
-// Guarded like the write in the finally below: a store that cannot be cleared must not take the caller's own
-// answer with it. A record left behind is simply read again next time, and the staleness check above is what
-// keeps that harmless.
-const forget = async ($: Pick<EngineInterface, 'store' | 'ui'>, why: string | undefined): Promise<void> => {
-  try {
-    await $.store.delete(STORE_KEY)
-  } catch {
-    say($, 'could not clear the record of what it made; it will be read again next time')
-    return
-  }
-  if (why !== undefined) say($, `forgot the record: ${why}`)
-}
-
-// The log is the only trace the bootstrap leaves: every way it can fail shows up to the person as "sessions
-// are named but never move", with nothing to say why, so what it did and why it stopped belongs on the record.
-const say = ($: Pick<EngineInterface, 'ui'>, text: string): void => {
-  // In a try, not only a .catch: ui.log is synchronous, so a throw of its own happens while the argument is
-  // evaluated and would never reach a promise's catch. Logging must not be able to break the bootstrap.
-  try {
-    void Promise.resolve($.ui.log(`session-board: ${text}`, { to: 'debug' })).catch(() => undefined)
-  } catch {
-    // Nothing to do: there is no second place to report that reporting failed.
-  }
-}
-
 // The sidebar's tools are the desktop app's own MCP tools: this build declares no types for them, so the
 // names, the `name` argument and the JSON shape read back are all measured against the app, not checked by
 // the compiler. Measured on Claude Code 2.1.295, 2026-10-15: list_sections answers a JSON array of
 // { id, kind, name, ... }, and create_section takes { name }.
-export const bootstrapSections = async ($: Pick<EngineInterface, 'tool' | 'store' | 'ui'>): Promise<readonly string[]> => {
+//
+// Nothing is remembered between sessions. An earlier version wrote down which of the five it had made, so a
+// run stopped partway could be finished later; the record and the sidebar could then disagree - the person
+// renames a section, or a creation commits but its answer never arrives - and every way of reconciling them
+// either duplicated a section beside the name the person chose or wedged the feature in silence. The sidebar
+// is the only state this reads now, and it reads it fresh. A run that stops partway stays stopped: the person
+// finishes the set themselves, or asks for it.
+export const bootstrapSections = async ($: Pick<EngineInterface, 'tool'>): Promise<readonly string[]> => {
   if (bootstrapped) return []
   bootstrapped = true
   // Outside the desktop app the sidebar's tools are not there at all; a call would merely be refused.
   const tools = new Set((await $.tool.list()).map(t => t.name))
   if (!tools.has(SECTIONS_TOOL) || !tools.has(CREATE_SECTION_TOOL)) return []
-  // Asked before anything is called: tool.check opens no dialog and runs nothing. Without it the mod's first
-  // act in a new session could be six approval dialogs the person never asked for, before the first prompt.
-  // Each call is checked with the arguments it will actually carry, since a rule may match on them: asking
-  // about an argument the tool never receives answers a question nobody will put.
-  const allowed = async (tool: string, input: Record<string, unknown>): Promise<boolean> => {
-    const { decision } = await $.tool.check({ tool, input })
-    if (decision === 'allow') return true
-    say($, `${tool} is not allowed outright (${decision}); leaving the sidebar alone`)
-    return false
-  }
-  if (!(await allowed(SECTIONS_TOOL, {}))) return []
   const listed = await $.tool.call({ tool: SECTIONS_TOOL })
-  if (!answered(listed) || listed.text === undefined) {
-    say($, 'could not read the sidebar; created nothing')
-    return []
-  }
+  if (!answered(listed) || listed.text === undefined) return []
   const names = sectionNames(listed.text)
-  if (names === undefined) {
-    say($, 'could not make out which sections the sidebar has; created nothing')
-    return []
-  }
+  // Undefined is "cannot tell", which is not "empty": creating on a listing it could not read would put the
+  // five beside sections that are already standing.
+  if (names === undefined) return []
   const existing = new Set(names)
-  // What an earlier session of this mod created before it was stopped partway. Without it a run that stopped
-  // after two would be stuck: one of the five now stands, so the guard below would decline to make the rest,
-  // for good and in silence.
-  const made = await recorded($)
-  // The record is only about the past, so before it licenses anything it has to still describe the present:
-  // every name the mod wrote down must still be standing. A record naming one that is gone has been
-  // overtaken - renamed or removed - and acting on it would create that name again beside the one the person
-  // chose. This is checked on its own, before anything else consults the record, because the state a rename
-  // leaves behind can have none of the five standing at all, and a check that only ran when one did would be
-  // skipped in exactly the case it exists for.
-  if ([...made].some(s => !existing.has(s))) {
-    // Their sidebar now, not the mod's half-finished work: let the record go rather than act on it again.
-    await forget($, 'the sections it had written down are not the ones standing now')
-    return []
-  }
-  // Now the record can be trusted, so it can say whose the standing sections are. Where any of the five
-  // stands and is not the mod's own, it is the person's to arrange, and the set is never completed around it.
-  const standing = SECTIONS.filter(s => existing.has(s))
-  if (standing.some(s => !made.has(s))) return []
-  const owing = SECTIONS.filter(s => !existing.has(s))
-  if (owing.length === 0) {
-    await forget($, undefined)
-    return []
-  }
-  // Every name it is about to create, before it creates the first: an allow for one of them is not an allow
-  // for the rest, and stopping halfway through is what leaves the sidebar half-built.
-  for (const name of owing) if (!(await allowed(CREATE_SECTION_TOOL, { name }))) return []
+  if (SECTIONS.some(s => existing.has(s))) return []
   const created: string[] = []
-  try {
-    // In order, so the sidebar lays them out the way the rule reads them.
-    for (const name of owing) {
-      const r = await $.tool.call({ tool: CREATE_SECTION_TOOL, name })
-      // A refusal answers on the union's deny arm, where isError is unset: stop at the first one rather than
-      // record it as made and ask four more times.
-      if (!answered(r)) {
-        say($, `${CREATE_SECTION_TOOL} did not answer for 「${name}」; made ${created.length} of ${owing.length}, the rest are owed to a later session`)
-        return created
-      }
-      created.push(name)
-    }
-  } finally {
-    // In a finally, because an aborted call rejects out of the loop and leaves the same half-built sidebar:
-    // either way what stands is written down, so a later session finishes the set instead of the guard above
-    // seeing one of the five and declining to create the rest for good.
-    // Guarded on its own, because an exception raised here would replace whatever the loop was doing: it
-    // would discard a return, swallow an abort's real cause, and lose the record it is here to keep.
-    const owed = created.length < owing.length
-    try {
-      // Only what is actually standing goes back in. An entry whose section is gone would rebuild the very
-      // claim the staleness check above exists to catch.
-      if (owed) await remember($, [...[...made].filter(s => existing.has(s)), ...created])
-      else await forget($, undefined)
-    } catch {
-      // Only remember can land here now: forget reports its own failure instead of throwing.
-      say($, 'could not write down what it made; a later session will read the sidebar afresh')
-    }
-    say($, owed ? `made ${created.length} of ${owing.length} sections; the rest are owed` : `made all ${owing.length} sections it was missing`)
+  // In order, so the sidebar lays them out the way the rule reads them. A call that does not answer - refused,
+  // failed, or never returned - stops the run where it stands: there is no retry and no later resume.
+  for (const name of SECTIONS) {
+    const r = await $.tool.call({ tool: CREATE_SECTION_TOOL, name })
+    if (!answered(r)) return created
+    created.push(name)
   }
   return created
 }

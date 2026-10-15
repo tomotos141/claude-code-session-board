@@ -95,45 +95,14 @@ const sidebar = (opts: {
   createDenied?: boolean
   createThrowsAt?: number
   without?: readonly string[]
-  decision?: string
-  decisionFor?: string
-  stored?: unknown
-  storeFails?: boolean
-  deleteFails?: boolean
-  logThrows?: boolean
 } = {}) => {
   const created: string[] = []
-  const logged: string[] = []
-  const store = new Map<string, unknown>(opts.stored === undefined ? [] : [['bootstrap.created', opts.stored]])
-  const writes: unknown[] = []
   const tools = [SECTIONS_TOOL, CREATE_SECTION_TOOL].filter(t => !(opts.without ?? []).includes(t))
   const text = opts.listed ?? JSON.stringify((opts.existing ?? []).map((name, i) => ({ id: `g${i}`, kind: 'manual', name })))
   let creates = 0
   const $ = {
-    ui: {
-      log: (line: string) => {
-        if (opts.logThrows === true) throw new Error('nowhere to log')
-        logged.push(line)
-      },
-    },
-    store: {
-      get: async (k: string) => store.get(k),
-      set: async (k: string, v: unknown) => {
-        if (opts.storeFails === true) throw new Error('the store is full')
-        writes.push(v)
-        store.set(k, v)
-      },
-      delete: async (k: string) => {
-        if (opts.deleteFails === true) throw new Error('the store is locked')
-        store.delete(k)
-      },
-    },
     tool: {
       list: async () => tools.map(name => ({ name })),
-      check: async (i: { tool: string; input?: { name?: string } }) => ({
-        decision: opts.decisionFor !== undefined && opts.decisionFor === i.input?.name ? 'deny' : (opts.decision ?? 'allow'),
-        checked: i,
-      }),
       call: async (input: { tool: string; name?: string }) => {
         if (input.tool === SECTIONS_TOOL) {
           if (opts.listDenied === true) return { deny: 'refused' }
@@ -150,7 +119,7 @@ const sidebar = (opts: {
       },
     },
   }
-  return { $: $ as never, created, logged, store, writes, calls: () => creates }
+  return { $: $ as never, created, calls: () => creates }
 }
 
 // bootstrapSections remembers that it ran for the life of the module, so each case clears that first.
@@ -269,12 +238,11 @@ test('rows with no readable name read as "cannot tell", not as an empty sidebar'
 
 test('a refused creation stops at once instead of asking four more times', async () => {
   const boot = fresh()
-  const { $, created, calls, store } = sidebar({ existing: [], createDenied: true })
+  const { $, created, calls } = sidebar({ existing: [], createDenied: true })
   expect(await boot($)).toEqual([])
   expect(created).toEqual([])
   // The refusal arm leaves isError unset; only one call may go out.
   expect(calls()).toBe(1)
-  expect(store.get('bootstrap.created')).toEqual([])
 })
 
 test('a refused listing creates nothing', async () => {
@@ -284,44 +252,28 @@ test('a refused listing creates nothing', async () => {
   expect(created).toEqual([])
 })
 
-test('a creation that stops partway is owed to the next session, not lost', async () => {
+test('a creation stopped partway stays stopped, and the next session does not finish it', async () => {
+  // Nothing is remembered, so what the sidebar shows is the whole truth. Two of the five stand, which means
+  // the rule below - create only when not one of them is there - declines for good. That is the trade the
+  // record used to buy off, and the record is what kept breaking; the person finishes the set instead.
   const boot = fresh()
-  const { $, created, store } = sidebar({ existing: [], createThrowsAt: 3 })
-  await expect(boot($)).rejects.toThrow()
+  const { $, created } = sidebar({ existing: [], createThrowsAt: 3 })
+  await expect(boot($)).rejects.toThrow('aborted')
   expect(created).toEqual(['確認待ち', '作業中'])
-  // Written on the way out, so a later session finishes the three that are still owed.
-  expect(store.get('bootstrap.created')).toEqual(['確認待ち', '作業中'])
+  // A later session, reading that half-built sidebar fresh: two of the five stand, so it leaves them be.
+  const again = fresh()
+  const second = sidebar({ existing: ['確認待ち', '作業中'] })
+  expect(await again(second.$)).toEqual([])
+  expect(second.created).toEqual([])
+  expect(second.calls()).toBe(0)
 })
 
-test('a creation refused partway records what it made for the next session', async () => {
+test('a creation refused partway keeps what it made and asks for no more', async () => {
   const boot = fresh()
-  const { $, created, store } = sidebar({ existing: [], createFails: true })
+  const { $, created, calls } = sidebar({ existing: [], createFails: true })
   expect(await boot($)).toEqual([])
   expect(created).toEqual([])
-  expect(store.get('bootstrap.created')).toEqual([])
-  expect(store.has('bootstrap.created')).toBe(true)
-})
-
-test('where the tools are not allowed outright, nothing is called', async () => {
-  for (const decision of ['ask', 'deny']) {
-    const boot = fresh()
-    const { $, created, calls, logged } = sidebar({ existing: [], decision })
-    expect(await boot($)).toEqual([])
-    expect(created).toEqual([])
-    expect(calls()).toBe(0)
-    expect(logged.join(' ')).toContain(decision)
-  }
-})
-
-test('a finished bootstrap clears what it had owed and says so', async () => {
-  // Resuming from a record that still agrees with the sidebar: 確認待ち stands and is the mod's own, so the
-  // four it still owes are made and the record, now describing nothing outstanding, is cleared.
-  const boot = fresh()
-  const { $, created, store, logged } = sidebar({ existing: ['確認待ち'], stored: ['確認待ち'] })
-  expect((await boot($)).length).toBe(4)
-  expect(created.length).toBe(4)
-  expect(store.has('bootstrap.created')).toBe(false)
-  expect(logged.join(' ')).toContain('made all 4')
+  expect(calls()).toBe(1)
 })
 
 test('a section typed in another normal form is not duplicated', async () => {
@@ -335,158 +287,8 @@ test('a section typed in another normal form is not duplicated', async () => {
 
 test('a section whose name is blank or padded does not stand in for one of the five', async () => {
   const boot = fresh()
-  const { $, created } = sidebar({ listed: JSON.stringify([{ id: 'g0', name: '  確認待ち  ' }]) })
+  // A padded 「保留」 is that section; a blank name is no section at all and must not read as one.
+  const { $, created } = sidebar({ listed: JSON.stringify([{ id: 'g0', name: '  保留  ' }, { id: 'g1', name: 'x' }]) })
   expect(await boot($)).toEqual([])
   expect(created).toEqual([])
-})
-
-test('a later session finishes the sections an earlier one was stopped partway through', async () => {
-  // The case the record exists for: two of the five stand, and the mod itself made them.
-  const boot = fresh()
-  const { $, created, store, logged } = sidebar({ existing: ['確認待ち', '作業中'], stored: ['確認待ち', '作業中'] })
-  expect(await boot($)).toEqual(['外部待ち', '保留', '完了'])
-  expect(created).toEqual(['外部待ち', '保留', '完了'])
-  expect(store.has('bootstrap.created')).toBe(false)
-  expect(logged.join(' ')).toContain('made all 3')
-})
-
-test('sections the mod did not make itself are never completed around', async () => {
-  // Two of the five stand but the record does not cover them: the person made or kept them, so the
-  // guard holds and nothing is created, exactly as before the bootstrap existed.
-  for (const stored of [undefined, ['確認待ち'] as readonly string[]]) {
-    const boot = fresh()
-    const { $, created } = sidebar({ existing: ['確認待ち', '作業中'], stored })
-    expect(await boot($)).toEqual([])
-    expect(created).toEqual([])
-  }
-})
-
-test('a section renamed between sessions is not recreated beside the name the person chose', async () => {
-  // The record says the mod made 確認待ち and 作業中; the person has since renamed 作業中 to one of their own.
-  // Only 確認待ち is still one of the five, and it IS in the record, so a one-directional check would call
-  // this a resume and create 作業中 beside their Doing. The record has to agree in both directions.
-  const boot = fresh()
-  const { $, created, store, logged } = sidebar({ existing: ['確認待ち', 'Doing'], stored: ['確認待ち', '作業中'] })
-  expect(await boot($)).toEqual([])
-  expect(created).toEqual([])
-  // Theirs now, so the stale record goes rather than being acted on again.
-  expect(store.has('bootstrap.created')).toBe(false)
-  expect(logged.join(' ')).toContain('not the ones standing now')
-})
-
-test('a section deleted between sessions is not recreated either', async () => {
-  const boot = fresh()
-  const { $, created } = sidebar({ existing: ['確認待ち'], stored: ['確認待ち', '作業中'] })
-  expect(await boot($)).toEqual([])
-  expect(created).toEqual([])
-})
-
-test('a hand-edited record is read as no record rather than acted on or thrown over', async () => {
-  // A bare string would become a Set of its characters; a number or an object throws on `new Set`, and that
-  // throw would leave through the swallowed catch and kill the bootstrap for the session with no trace.
-  for (const stored of ['確認待ち', 5, true, { a: 1 }, null]) {
-    const boot = fresh()
-    const { $, created, logged } = sidebar({ existing: ['確認待ち'], stored })
-    expect(await boot($)).toEqual([])
-    expect(created).toEqual([])
-    expect(logged.join(' ')).toContain('not readable')
-  }
-})
-
-test('junk entries inside the record are dropped, and the rest still resumes', async () => {
-  const boot = fresh()
-  const { $, created } = sidebar({ existing: ['確認待ち'], stored: ['確認待ち', 42, null, { x: 1 }] })
-  expect(await boot($)).toEqual(['作業中', '外部待ち', '保留', '完了'])
-  expect(created).toEqual(['作業中', '外部待ち', '保留', '完了'])
-})
-
-test('what it writes down is deduplicated, never a growing list', async () => {
-  // A record that still agrees with the sidebar: 確認待ち stands and the record says the mod made it. The run
-  // resumes, is refused at the first of the four it still owes, and writes the record back unchanged.
-  const boot = fresh()
-  const { $, store, writes } = sidebar({ existing: ['確認待ち'], stored: ['確認待ち'], createFails: true })
-  await boot($)
-  expect(store.get('bootstrap.created')).toEqual(['確認待ち'])
-  for (const w of writes) expect((w as readonly string[]).length).toBe(new Set(w as readonly string[]).size)
-})
-
-test('a record entry whose section is gone is not carried forward into the next record', async () => {
-  // 確認待ち stands and is the mod's; 作業中 was in the record but the person deleted it. Writing 作業中 back
-  // would rebuild the stale claim the staleness check is there to catch, and the next session would act on
-  // it. Only what is actually standing, plus what this run made, goes in.
-  const boot = fresh()
-  const { $, store } = sidebar({ existing: ['確認待ち'], stored: ['確認待ち'], createThrowsAt: 2 })
-  await expect(boot($)).rejects.toThrow('aborted')
-  // It made 作業中 before the abort, so that is in; nothing stale is.
-  expect(store.get('bootstrap.created')).toEqual(['確認待ち', '作業中'])
-})
-
-test('a store that cannot be written loses neither the result nor the session', async () => {
-  // A partial run is the case that writes: the finally must not replace the loop's own answer, or the
-  // refusal's return, with the store's exception.
-  const boot = fresh()
-  const { $, created, logged } = sidebar({ existing: [], storeFails: true, createFails: true })
-  expect(await boot($)).toEqual([])
-  expect(created).toEqual([])
-  expect(logged.join(' ')).toContain('could not write down')
-})
-
-test('a complete run whose record cannot be cleared still answers with what it made', async () => {
-  const boot = fresh()
-  const { $, created } = sidebar({ existing: [], storeFails: true })
-  expect((await boot($)).length).toBe(5)
-  expect(created.length).toBe(5)
-})
-
-test('a store that cannot be written does not swallow a real failure either', async () => {
-  const boot = fresh()
-  const { $ } = sidebar({ existing: [], storeFails: true, createThrowsAt: 2 })
-  // The abort's own cause must come out, not the store's.
-  await expect(boot($)).rejects.toThrow('aborted')
-})
-
-test('logging that throws cannot break the bootstrap', async () => {
-  const boot = fresh()
-  const { $, created } = sidebar({ existing: [], logThrows: true })
-  expect((await boot($)).length).toBe(5)
-  expect(created.length).toBe(5)
-})
-
-test('each name it will create is checked, not just the first', async () => {
-  // An allow for 確認待ち is not an allow for 完了; stopping halfway is what leaves a half-built sidebar.
-  const boot = fresh()
-  const { $, created, calls } = sidebar({ existing: [], decisionFor: '完了' })
-  expect(await boot($)).toEqual([])
-  expect(created).toEqual([])
-  expect(calls()).toBe(0)
-})
-
-test('the only section it made, since renamed, does not bring the other four down on top of it', async () => {
-  // The hard case: the record names one section, the person has renamed it, so NONE of the five is standing.
-  // A staleness check that only ran when one of the five was standing would be skipped here and all five
-  // would be created beside the name they chose - the exact duplication this design exists to prevent.
-  const boot = fresh()
-  const { $, created, store, logged } = sidebar({ existing: ['Inbox'], stored: ['確認待ち'] })
-  expect(await boot($)).toEqual([])
-  expect(created).toEqual([])
-  expect(store.has('bootstrap.created')).toBe(false)
-  expect(logged.join(' ')).toContain('not the ones standing now')
-})
-
-test('the only section it made, since deleted, is not quietly made again', async () => {
-  // Deleting it is a decision as much as renaming it is. The sidebar is empty of the five either way, and
-  // the record is the only thing that can tell the difference from a sidebar nobody has touched.
-  const boot = fresh()
-  const { $, created } = sidebar({ existing: [], stored: ['確認待ち'] })
-  expect(await boot($)).toEqual([])
-  expect(created).toEqual([])
-})
-
-test('a store that cannot be cleared loses neither the result nor the session', async () => {
-  // The completion path clears the record. If the clear throws, the five it just made are still its answer.
-  const boot = fresh()
-  const { $, created, logged } = sidebar({ existing: [], deleteFails: true })
-  expect((await boot($)).length).toBe(5)
-  expect(created.length).toBe(5)
-  expect(logged.join(' ')).toContain('could not clear the record')
 })
