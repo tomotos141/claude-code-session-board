@@ -1,0 +1,15 @@
+{
+  "name": "claude-code-session-board",
+  "owner": { "name": "tomotos141" },
+  "metadata": {
+    "description": "A Claude Code plugin that files each session under whoever moves next",
+    "version": "0.4.0"
+  },
+  "plugins": [
+    {
+      "name": "session-board",
+      "description": "Names the session once, then keeps it in the sidebar section for whoever moves next: you, Claude, someone else, nobody, or no one at all",
+      "source": "./plugins/session-board"
+    }
+  ]
+}
