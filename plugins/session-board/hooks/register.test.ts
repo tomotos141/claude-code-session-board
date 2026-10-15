@@ -104,19 +104,22 @@ const sidebar = (opts: {
   const text = opts.listed ?? JSON.stringify((opts.existing ?? []).map((name, i) => ({ id: `g${i}`, kind: 'manual', name })))
   let creates = 0
   // Recorded, not just answered: how many checks go out and in what order is the whole point of asking before
-  // the existence gate rather than after it, and a double that only counts calls cannot see that.
-  const checked: { tool: string; name?: string }[] = []
+  // the existence gate rather than after it, and a double that only counts calls cannot see that. Checks and
+  // calls share one log, because the orderings that matter run across the two - the listing is checked before
+  // it is read, and every name is checked before the first section is made.
+  const log: { kind: 'check' | 'call'; tool: string; name?: string }[] = []
   const $ = {
     tool: {
       list: async () => tools.map(name => ({ name })),
       // A rule may match on the arguments, so the double answers per name, as the real check does.
       check: async (i: { tool: string; input?: { name?: string } }) => {
-        checked.push({ tool: i.tool, name: i.input?.name })
+        log.push({ kind: 'check', tool: i.tool, ...(i.input?.name === undefined ? {} : { name: i.input.name }) })
         return {
           decision: opts.decisionFor !== undefined && opts.decisionFor === i.input?.name ? 'deny' : (opts.decision ?? 'allow'),
         }
       },
       call: async (input: { tool: string; name?: string }) => {
+        log.push({ kind: 'call', tool: input.tool, ...(input.name === undefined ? {} : { name: input.name }) })
         if (input.tool === SECTIONS_TOOL) {
           if (opts.listDenied === true) return { deny: 'refused' }
           return opts.listFails === true ? { isError: true, result: 'no' } : { result: { text }, text }
@@ -132,7 +135,7 @@ const sidebar = (opts: {
       },
     },
   }
-  return { $: $ as never, created, calls: () => creates, checked }
+  return { $: $ as never, created, calls: () => creates, log }
 }
 
 // bootstrapSections remembers that it ran for the life of the module, so each case clears that first.
@@ -344,23 +347,29 @@ test('a sidebar that already has one of the five is asked about once, not six ti
   // costs one check and the listing, and nothing else. Hoisting them up beside the listing check would group
   // the six neatly and cost five needless permission queries at every session start; this notices that.
   const boot = fresh()
-  const { $, created, calls, checked } = sidebar({ existing: ['完了'] })
+  const { $, created, calls, log } = sidebar({ existing: ['完了'] })
   expect(await boot($)).toEqual([])
   expect(created).toEqual([])
   // calls() counts creations alone, and a sidebar that has one of the five is created nothing, by the rule.
   expect(calls()).toBe(0)
-  expect(checked).toEqual([{ tool: SECTIONS_TOOL, name: undefined }])
+  // Strictly, so a check that carried no name differs from one that carried undefined.
+  expect(log).toStrictEqual([
+    { kind: 'check', tool: SECTIONS_TOOL },
+    { kind: 'call', tool: SECTIONS_TOOL },
+  ])
 })
 
-test('on an empty sidebar all six are checked, the listing first and then the five by name', async () => {
-  // Every name before the first creation, in the order they are created: an allow for one is not an allow for
-  // the rest, and the listing has to be checked before it is read.
+test('on an empty sidebar every check precedes the thing it is about', async () => {
+  // The whole sequence, checks and calls in one log: the listing is checked before it is read, and all five
+  // names are checked before the first section is made - an allow for one is not an allow for the rest.
   const boot = fresh()
-  const { $, checked } = sidebar({ existing: [] })
+  const { $, log } = sidebar({ existing: [] })
   expect(await boot($)).toEqual([...SECTIONS])
-  expect(checked).toEqual([
-    { tool: SECTIONS_TOOL, name: undefined },
-    ...SECTIONS.map(name => ({ tool: CREATE_SECTION_TOOL, name })),
+  expect(log).toStrictEqual([
+    { kind: 'check', tool: SECTIONS_TOOL },
+    { kind: 'call', tool: SECTIONS_TOOL },
+    ...SECTIONS.map(name => ({ kind: 'check' as const, tool: CREATE_SECTION_TOOL, name })),
+    ...SECTIONS.map(name => ({ kind: 'call' as const, tool: CREATE_SECTION_TOOL, name })),
   ])
 })
 
