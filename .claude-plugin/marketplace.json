@@ -3,7 +3,7 @@
   "owner": { "name": "tomotos141" },
   "metadata": {
     "description": "A Claude Code plugin that files each session under whoever moves next",
-    "version": "0.4.0"
+    "version": "0.5.0"
   },
   "plugins": [
     {

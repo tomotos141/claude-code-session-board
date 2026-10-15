@@ -1,4 +1,4 @@
-import type { PromptComposeInput, PromptComposeSection, Register } from 'claude-code'
+import type { EngineInterface, PromptComposeInput, PromptComposeSection, Register } from 'claude-code'
 
 // The name only tells sessions apart; the state goes in the sidebar's sections. A state word in the name
 // rewrote the name at every state change and was cut off at the end of a long name (measured 2026-10-14).
@@ -8,6 +8,7 @@ import type { PromptComposeInput, PromptComposeSection, Register } from 'claude-
 export const TITLE_TOOL = 'mcp__ccd_session_mgmt__set_session_title'
 export const MOVE_TOOL = 'mcp__ccd_sidebar__move_sessions'
 export const SECTIONS_TOOL = 'mcp__ccd_sidebar__list_sections'
+export const CREATE_SECTION_TOOL = 'mcp__ccd_sidebar__create_section'
 export const PUSH_TOOL = 'PushNotification'
 export const SECTIONS = ['確認待ち', '作業中', '外部待ち', '保留', '完了'] as const
 
@@ -51,7 +52,63 @@ const RULES: Record<string, string> = {
 // PushNotification stays where it is: it exists outside the desktop too, and tool.describe cannot tell the sessions apart.
 const FRONT = new Set([TITLE_TOOL, MOVE_TOOL, SECTIONS_TOOL])
 
+// Reading the sections back: list_sections answers with its rows as JSON text, so the names come out of
+// whatever shape parses. A listing that does not parse answers undefined, not an empty list: "no name here"
+// and "cannot tell what is here" must not be the same answer, or an unreadable listing would read as an
+// empty sidebar and the five would be created over sections that are already standing.
+export const sectionNames = (text: string): readonly string[] | undefined => {
+  try {
+    const parsed: unknown = JSON.parse(text)
+    const rows = Array.isArray(parsed) ? parsed : (parsed as { sections?: unknown })?.sections
+    if (!Array.isArray(rows)) return undefined
+    return rows.flatMap(r => (typeof (r as { name?: unknown })?.name === 'string' ? [(r as { name: string }).name] : []))
+  } catch {
+    return undefined
+  }
+}
+
+// The five are created only when not one of them exists. The mod looks sections up by exact name and never
+// creates a missing one: that is what keeps a renamed section from being quietly duplicated. "Not one of the
+// five is there" means nobody has made them yet, so there is nothing to duplicate and the guard still holds.
+// Once any one exists the person's own naming is in play, and this does nothing for the rest of the session.
+let bootstrapped = false
+
+// Only for the tests, which exercise several sidebars in one load of the module.
+export const resetBootstrapForTests = (): void => {
+  bootstrapped = false
+}
+
+// The sidebar's tools are the desktop app's own MCP tools, so they are not in the build's tool table and
+// tool.call is reached through its untyped overload.
+export const bootstrapSections = async ($: Pick<EngineInterface, 'tool'>): Promise<readonly string[]> => {
+  if (bootstrapped) return []
+  bootstrapped = true
+  // Outside the desktop app the sidebar's tools are not there at all; a call would merely be refused.
+  const tools = new Set((await $.tool.list()).map(t => t.name))
+  if (!tools.has(SECTIONS_TOOL) || !tools.has(CREATE_SECTION_TOOL)) return []
+  const listed = await $.tool.call({ tool: SECTIONS_TOOL } as never)
+  if (listed.isError === true || listed.text === undefined) return []
+  const names = sectionNames(listed.text)
+  if (names === undefined) return []
+  const existing = new Set(names)
+  if (SECTIONS.some(s => existing.has(s))) return []
+  const created: string[] = []
+  // In order, so the sidebar lays them out the way the rule reads them.
+  for (const name of SECTIONS) {
+    const r = await $.tool.call({ tool: CREATE_SECTION_TOOL, name } as never)
+    if (r.isError === true) break
+    created.push(name)
+  }
+  return created
+}
+
 export const register: Register = on => {
+  // Not awaited, and its failure is swallowed: a slow or refused sidebar must not hold up the session's start.
+  on('session.start', async ($, e, next) => {
+    void bootstrapSections($).catch(() => undefined)
+    return next(e)
+  })
+
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
     if (!isWatchedMain(e)) return composed

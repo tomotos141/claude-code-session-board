@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { isOverviewUpdate, MOVE_TOOL, PUSH_TOOL, SECTIONS_TOOL, TITLE_TOOL } from './register'
+import { bootstrapSections, CREATE_SECTION_TOOL, isOverviewUpdate, MOVE_TOOL, PUSH_TOOL, SECTIONS, SECTIONS_TOOL, resetBootstrapForTests, TITLE_TOOL } from './register'
 
 const OVERVIEW = 'mcp__overview__update'
 
@@ -82,4 +82,111 @@ test('other results, failed updates and subagent updates carry no reminder', asy
   expect(await reminders($, session, row('Bash'))).toEqual([])
   expect(await reminders($, session, row(OVERVIEW, true))).toEqual([])
   expect(await reminders($, session, row(OVERVIEW, false, 'a1'))).toEqual([])
+})
+
+// A stand-in for the sidebar: what list_sections answers, and the create calls it records.
+const sidebar = (opts: { existing?: readonly string[]; listed?: string; listFails?: boolean; createFails?: boolean; without?: readonly string[] } = {}) => {
+  const created: string[] = []
+  const tools = [SECTIONS_TOOL, CREATE_SECTION_TOOL].filter(t => !(opts.without ?? []).includes(t))
+  const text = opts.listed ?? JSON.stringify((opts.existing ?? []).map((name, i) => ({ id: `g${i}`, kind: 'manual', name })))
+  const $ = {
+    tool: {
+      list: async () => tools.map(name => ({ name })),
+      call: async (input: { tool: string; name?: string }) => {
+        if (input.tool === SECTIONS_TOOL) return opts.listFails === true ? { isError: true, text: 'no' } : { text }
+        if (input.tool !== CREATE_SECTION_TOOL) throw new Error(`unexpected ${input.tool}`)
+        if (opts.createFails === true) return { isError: true, text: 'refused' }
+        created.push(input.name ?? '')
+        return { text: '{"id":"new"}' }
+      },
+    },
+  }
+  return { $: $ as never, created }
+}
+
+// bootstrapSections remembers that it ran for the life of the module; each case starts from a clean slate.
+const fresh = async () => {
+  resetBootstrapForTests()
+  return { bootstrapSections }
+}
+
+test('with no section at all, the five are created in the order the rule reads them', async () => {
+  const { bootstrapSections: boot } = await fresh()
+  const { $, created } = sidebar({ existing: [] })
+  expect(await boot($)).toEqual([...SECTIONS])
+  expect(created).toEqual(['確認待ち', '作業中', '外部待ち', '保留', '完了'])
+})
+
+test('one of the five already there means none is created', async () => {
+  for (const existing of [['完了'], ['確認待ち'], SECTIONS, ['作業中', 'Inbox']]) {
+    const { bootstrapSections: boot } = await fresh()
+    const { $, created } = sidebar({ existing })
+    expect(await boot($)).toEqual([])
+    expect(created).toEqual([])
+  }
+})
+
+test('sections under other names are left alone and do not block the five', async () => {
+  const { bootstrapSections: boot } = await fresh()
+  const { $, created } = sidebar({ existing: ['Inbox', 'Later'] })
+  expect(await boot($)).toEqual([...SECTIONS])
+  expect(created.length).toBe(5)
+})
+
+test('it runs once per load, and a second call creates nothing', async () => {
+  const { bootstrapSections: boot } = await fresh()
+  const first = sidebar({ existing: [] })
+  expect((await boot(first.$)).length).toBe(5)
+  const second = sidebar({ existing: [] })
+  expect(await boot(second.$)).toEqual([])
+  expect(second.created).toEqual([])
+})
+
+test('a listing it cannot read creates nothing, rather than guessing the sidebar is empty', async () => {
+  for (const listed of ['not json', '{"sections":"x"}', '[]garbage']) {
+    const { bootstrapSections: boot } = await fresh()
+    const { $, created } = sidebar({ listed })
+    expect(await boot($)).toEqual([])
+    expect(created).toEqual([])
+  }
+})
+
+test('a listing that fails creates nothing', async () => {
+  const { bootstrapSections: boot } = await fresh()
+  const { $, created } = sidebar({ listFails: true })
+  expect(await boot($)).toEqual([])
+  expect(created).toEqual([])
+})
+
+test('a refused creation stops there instead of carrying on', async () => {
+  const { bootstrapSections: boot } = await fresh()
+  const { $, created } = sidebar({ existing: [], createFails: true })
+  expect(await boot($)).toEqual([])
+  expect(created).toEqual([])
+})
+
+test('without the sidebar tools, as outside the desktop app, nothing is called', async () => {
+  for (const without of [[SECTIONS_TOOL], [CREATE_SECTION_TOOL], [SECTIONS_TOOL, CREATE_SECTION_TOOL]]) {
+    const { bootstrapSections: boot } = await fresh()
+    const { $, created } = sidebar({ existing: [], without })
+    expect(await boot($)).toEqual([])
+    expect(created).toEqual([])
+  }
+})
+
+test('an empty sidebar is read from either shape list_sections may answer with', async () => {
+  for (const listed of ['[]', '{"sections":[]}']) {
+    const { bootstrapSections: boot } = await fresh()
+    const { $, created } = sidebar({ listed })
+    expect((await boot($)).length).toBe(5)
+    expect(created.length).toBe(5)
+  }
+})
+
+test('the session starts even where the sidebar never answers', async ($, on) => {
+  resetBootstrapForTests()
+  // Beneath the plugin: the sidebar's own tools are absent, as in a terminal session.
+  on('session.start', async (_$, e) => ({ cwd: e.cwd }))
+  const started = await $.session.start({ cwd: '/w', surface: null, isInteractive: false })
+  expect(started.cwd).toBe('/w')
 })
