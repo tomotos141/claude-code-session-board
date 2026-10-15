@@ -110,10 +110,15 @@ export const bootstrapSections = async ($: Pick<EngineInterface, 'tool'>): Promi
   if (!tools.has(SECTIONS_TOOL) || !tools.has(CREATE_SECTION_TOOL)) return []
   // Asked before anything is called: tool.check opens no dialog and runs nothing. This is about the number of
   // dialogs, not about any state the mod keeps - without it the mod's first act in a new session could be six
-  // approval dialogs the person never asked for, before their first prompt. It also makes the half-built
-  // sidebar unreachable from the dialog path: if any one of the six would be asked or denied, nothing is
-  // called at all, rather than the person approving three and dismissing the fourth. Each call is checked with
-  // the arguments it will actually carry, since a rule may match on them.
+  // approval dialogs the person never asked for, before their first prompt. Each call is checked with the
+  // arguments it will actually carry, since a rule may match on them.
+  //
+  // It closes the declarative path to a half-built sidebar - settings rules, the permission mode, another
+  // plugin's tool.check hook - and no more than that. Per the engine's own contract tool.check asks no
+  // PreToolUse hook and no auto-mode classifier, while each real call is decided with them, so an allow here
+  // is not a promise that the call will not be refused. A refusal on the third create still leaves two
+  // sections standing, which the rule above then declines to complete, for good. That is the documented
+  // trade - a run stopped partway stays stopped - and the preflight makes it rarer, not impossible.
   const allowed = async (tool: string, input: Record<string, unknown>): Promise<boolean> =>
     (await $.tool.check({ tool, input })).decision === 'allow'
   if (!(await allowed(SECTIONS_TOOL, {}))) return []

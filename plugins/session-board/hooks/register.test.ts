@@ -91,9 +91,9 @@ const sidebar = (opts: {
   listed?: string
   listFails?: boolean
   listDenied?: boolean
-  createFails?: boolean
   createFailsAt?: number
   createDenied?: boolean
+  createDeniedAt?: number
   createThrowsAt?: number
   without?: readonly string[]
   decision?: string
@@ -119,8 +119,8 @@ const sidebar = (opts: {
         creates += 1
         if (opts.createThrowsAt === creates) throw new Error('the call was aborted')
         // A refusal carries `deny` and leaves isError unset: taking that for a success is the bug this covers.
-        if (opts.createDenied === true) return { deny: 'the user said no' }
-        if (opts.createFails === true || opts.createFailsAt === creates) return { isError: true, result: 'refused' }
+        if (opts.createDenied === true || opts.createDeniedAt === creates) return { deny: 'the user said no' }
+        if (opts.createFailsAt === creates) return { isError: true, result: 'refused' }
         created.push(input.name ?? '')
         return { result: { id: 'new' }, text: '{"id":"new"}' }
       },
@@ -183,9 +183,10 @@ test('a listing that fails creates nothing', async () => {
   expect(created).toEqual([])
 })
 
-test('a refused creation stops there instead of carrying on', async () => {
+test('a creation that fails stops there instead of carrying on', async () => {
+  // The error arm (isError), not the deny arm; the refusal arm is its own test below.
   const boot = fresh()
-  const { $, created } = sidebar({ existing: [], createFails: true })
+  const { $, created } = sidebar({ existing: [], createFailsAt: 1 })
   expect(await boot($)).toEqual([])
   expect(created).toEqual([])
 })
@@ -330,4 +331,16 @@ test('where the sidebar tools are not allowed outright, nothing is called', asyn
   expect(await boot($)).toEqual([])
   expect(created).toEqual([])
   expect(calls()).toBe(0)
+})
+
+test('an allow from the preflight is not a promise, so a late refusal can still leave some standing', async () => {
+  // The preflight covers rules and modes; per the engine's contract it asks no PreToolUse hook and no
+  // auto-mode classifier, while each real call is decided with them. So all six can be allowed here and the
+  // third create refused anyway. Two sections stand, and the rule declines to complete the set for good.
+  // This is the documented trade, pinned so nobody reads the preflight as making it impossible.
+  const boot = fresh()
+  const { $, created, calls } = sidebar({ existing: [], createDeniedAt: 3 })
+  expect(await boot($)).toEqual(['確認待ち', '作業中'])
+  expect(created).toEqual(['確認待ち', '作業中'])
+  expect(calls()).toBe(3)
 })
