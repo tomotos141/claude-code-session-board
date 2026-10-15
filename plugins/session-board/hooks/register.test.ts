@@ -84,34 +84,63 @@ test('other results, failed updates and subagent updates carry no reminder', asy
   expect(await reminders($, session, row(OVERVIEW, false, 'a1'))).toEqual([])
 })
 
-// A stand-in for the sidebar: what list_sections answers, and the create calls it records.
-const sidebar = (opts: { existing?: readonly string[]; listed?: string; listFails?: boolean; createFails?: boolean; without?: readonly string[] } = {}) => {
+// A stand-in for the sidebar: what list_sections answers, the create calls it records, the store the
+// bootstrap carries unfinished work in, and the debug lines it leaves.
+const sidebar = (opts: {
+  existing?: readonly string[]
+  listed?: string
+  listFails?: boolean
+  listDenied?: boolean
+  createFails?: boolean
+  createDenied?: boolean
+  createThrowsAt?: number
+  without?: readonly string[]
+  decision?: string
+  stored?: readonly string[]
+} = {}) => {
   const created: string[] = []
+  const logged: string[] = []
+  const store = new Map<string, unknown>(opts.stored === undefined ? [] : [['bootstrap.created', opts.stored]])
   const tools = [SECTIONS_TOOL, CREATE_SECTION_TOOL].filter(t => !(opts.without ?? []).includes(t))
   const text = opts.listed ?? JSON.stringify((opts.existing ?? []).map((name, i) => ({ id: `g${i}`, kind: 'manual', name })))
+  let creates = 0
   const $ = {
+    ui: { log: async (line: string) => void logged.push(line) },
+    store: {
+      get: async (k: string) => store.get(k),
+      set: async (k: string, v: unknown) => void store.set(k, v),
+      delete: async (k: string) => void store.delete(k),
+    },
     tool: {
       list: async () => tools.map(name => ({ name })),
+      check: async () => ({ decision: opts.decision ?? 'allow' }),
       call: async (input: { tool: string; name?: string }) => {
-        if (input.tool === SECTIONS_TOOL) return opts.listFails === true ? { isError: true, text: 'no' } : { text }
+        if (input.tool === SECTIONS_TOOL) {
+          if (opts.listDenied === true) return { deny: 'refused' }
+          return opts.listFails === true ? { isError: true, result: 'no' } : { result: { text }, text }
+        }
         if (input.tool !== CREATE_SECTION_TOOL) throw new Error(`unexpected ${input.tool}`)
-        if (opts.createFails === true) return { isError: true, text: 'refused' }
+        creates += 1
+        if (opts.createThrowsAt === creates) throw new Error('the call was aborted')
+        // A refusal carries `deny` and leaves isError unset: taking that for a success is the bug this covers.
+        if (opts.createDenied === true) return { deny: 'the user said no' }
+        if (opts.createFails === true) return { isError: true, result: 'refused' }
         created.push(input.name ?? '')
-        return { text: '{"id":"new"}' }
+        return { result: { id: 'new' }, text: '{"id":"new"}' }
       },
     },
   }
-  return { $: $ as never, created }
+  return { $: $ as never, created, logged, store, calls: () => creates }
 }
 
-// bootstrapSections remembers that it ran for the life of the module; each case starts from a clean slate.
-const fresh = async () => {
+// bootstrapSections remembers that it ran for the life of the module, so each case clears that first.
+const fresh = () => {
   resetBootstrapForTests()
-  return { bootstrapSections }
+  return bootstrapSections
 }
 
 test('with no section at all, the five are created in the order the rule reads them', async () => {
-  const { bootstrapSections: boot } = await fresh()
+  const boot = fresh()
   const { $, created } = sidebar({ existing: [] })
   expect(await boot($)).toEqual([...SECTIONS])
   expect(created).toEqual(['確認待ち', '作業中', '外部待ち', '保留', '完了'])
@@ -119,7 +148,7 @@ test('with no section at all, the five are created in the order the rule reads t
 
 test('one of the five already there means none is created', async () => {
   for (const existing of [['完了'], ['確認待ち'], SECTIONS, ['作業中', 'Inbox']]) {
-    const { bootstrapSections: boot } = await fresh()
+    const boot = fresh()
     const { $, created } = sidebar({ existing })
     expect(await boot($)).toEqual([])
     expect(created).toEqual([])
@@ -127,14 +156,14 @@ test('one of the five already there means none is created', async () => {
 })
 
 test('sections under other names are left alone and do not block the five', async () => {
-  const { bootstrapSections: boot } = await fresh()
+  const boot = fresh()
   const { $, created } = sidebar({ existing: ['Inbox', 'Later'] })
   expect(await boot($)).toEqual([...SECTIONS])
   expect(created.length).toBe(5)
 })
 
 test('it runs once per load, and a second call creates nothing', async () => {
-  const { bootstrapSections: boot } = await fresh()
+  const boot = fresh()
   const first = sidebar({ existing: [] })
   expect((await boot(first.$)).length).toBe(5)
   const second = sidebar({ existing: [] })
@@ -144,7 +173,7 @@ test('it runs once per load, and a second call creates nothing', async () => {
 
 test('a listing it cannot read creates nothing, rather than guessing the sidebar is empty', async () => {
   for (const listed of ['not json', '{"sections":"x"}', '[]garbage']) {
-    const { bootstrapSections: boot } = await fresh()
+    const boot = fresh()
     const { $, created } = sidebar({ listed })
     expect(await boot($)).toEqual([])
     expect(created).toEqual([])
@@ -152,14 +181,14 @@ test('a listing it cannot read creates nothing, rather than guessing the sidebar
 })
 
 test('a listing that fails creates nothing', async () => {
-  const { bootstrapSections: boot } = await fresh()
+  const boot = fresh()
   const { $, created } = sidebar({ listFails: true })
   expect(await boot($)).toEqual([])
   expect(created).toEqual([])
 })
 
 test('a refused creation stops there instead of carrying on', async () => {
-  const { bootstrapSections: boot } = await fresh()
+  const boot = fresh()
   const { $, created } = sidebar({ existing: [], createFails: true })
   expect(await boot($)).toEqual([])
   expect(created).toEqual([])
@@ -167,7 +196,7 @@ test('a refused creation stops there instead of carrying on', async () => {
 
 test('without the sidebar tools, as outside the desktop app, nothing is called', async () => {
   for (const without of [[SECTIONS_TOOL], [CREATE_SECTION_TOOL], [SECTIONS_TOOL, CREATE_SECTION_TOOL]]) {
-    const { bootstrapSections: boot } = await fresh()
+    const boot = fresh()
     const { $, created } = sidebar({ existing: [], without })
     expect(await boot($)).toEqual([])
     expect(created).toEqual([])
@@ -176,17 +205,136 @@ test('without the sidebar tools, as outside the desktop app, nothing is called',
 
 test('an empty sidebar is read from either shape list_sections may answer with', async () => {
   for (const listed of ['[]', '{"sections":[]}']) {
-    const { bootstrapSections: boot } = await fresh()
+    const boot = fresh()
     const { $, created } = sidebar({ listed })
     expect((await boot($)).length).toBe(5)
     expect(created.length).toBe(5)
   }
 })
 
-test('the session starts even where the sidebar never answers', async ($, on) => {
+// Driving the real hook: the plugin's session.start sits above whatever answers tool.list beneath it, so a
+// sidebar that throws or never answers is reached through the hook itself, not by calling bootstrapSections.
+const startsWith = async (
+  $: { session: { start: (i: never) => Promise<{ cwd: string }> } },
+  on: (e: string, h: (...a: never[]) => Promise<unknown>) => void,
+  list: () => Promise<never>,
+) => {
   resetBootstrapForTests()
-  // Beneath the plugin: the sidebar's own tools are absent, as in a terminal session.
-  on('session.start', async (_$, e) => ({ cwd: e.cwd }))
-  const started = await $.session.start({ cwd: '/w', surface: null, isInteractive: false })
+  on('session.start', async (_$: never, e: never) => ({ cwd: (e as { cwd: string }).cwd }))
+  on('tool.list', list)
+  return $.session.start({ cwd: '/w', surface: null, isInteractive: false } as never)
+}
+
+test('a sidebar that throws cannot fail the session start', async ($, on) => {
+  const started = await startsWith($, on as never, async () => {
+    throw new Error('the sidebar is gone')
+  })
   expect(started.cwd).toBe('/w')
+})
+
+test('a sidebar that never answers cannot hold up the session start', async ($, on) => {
+  // Were the bootstrap awaited, this start would never resolve and the test would time out.
+  const started = await startsWith($, on as never, () => new Promise<never>(() => undefined))
+  expect(started.cwd).toBe('/w')
+})
+
+test('rows with no readable name read as "cannot tell", not as an empty sidebar', async () => {
+  for (const listed of ['[{"id":"g0","kind":"manual"}]', '[{"id":"g0","name":null},{"id":"g1"}]']) {
+    const boot = fresh()
+    const { $, created } = sidebar({ listed })
+    expect(await boot($)).toEqual([])
+    expect(created).toEqual([])
+  }
+})
+
+test('a refused creation stops at once instead of asking four more times', async () => {
+  const boot = fresh()
+  const { $, created, calls, store } = sidebar({ existing: [], createDenied: true })
+  expect(await boot($)).toEqual([])
+  expect(created).toEqual([])
+  // The refusal arm leaves isError unset; only one call may go out.
+  expect(calls()).toBe(1)
+  expect(store.get('bootstrap.created')).toEqual([])
+})
+
+test('a refused listing creates nothing', async () => {
+  const boot = fresh()
+  const { $, created } = sidebar({ listDenied: true })
+  expect(await boot($)).toEqual([])
+  expect(created).toEqual([])
+})
+
+test('a creation that stops partway is owed to the next session, not lost', async () => {
+  const boot = fresh()
+  const { $, created, store } = sidebar({ existing: [], createThrowsAt: 3 })
+  await expect(boot($)).rejects.toThrow()
+  expect(created).toEqual(['確認待ち', '作業中'])
+  // Written on the way out, so a later session finishes the three that are still owed.
+  expect(store.get('bootstrap.created')).toEqual(['確認待ち', '作業中'])
+})
+
+test('a creation refused partway records what it made for the next session', async () => {
+  const boot = fresh()
+  const { $, created, store } = sidebar({ existing: [], createFails: true })
+  expect(await boot($)).toEqual([])
+  expect(created).toEqual([])
+  expect(store.get('bootstrap.created')).toEqual([])
+  expect(store.has('bootstrap.created')).toBe(true)
+})
+
+test('where the tools are not allowed outright, nothing is called', async () => {
+  for (const decision of ['ask', 'deny']) {
+    const boot = fresh()
+    const { $, created, calls, logged } = sidebar({ existing: [], decision })
+    expect(await boot($)).toEqual([])
+    expect(created).toEqual([])
+    expect(calls()).toBe(0)
+    expect(logged.join(' ')).toContain(decision)
+  }
+})
+
+test('a finished bootstrap clears what it had owed and says so', async () => {
+  const boot = fresh()
+  const { $, created, store, logged } = sidebar({ existing: [], stored: ['確認待ち'] })
+  expect((await boot($)).length).toBe(5)
+  expect(created.length).toBe(5)
+  expect(store.has('bootstrap.created')).toBe(false)
+  expect(logged.join(' ')).toContain('made all 5')
+})
+
+test('a section typed in another normal form is not duplicated', async () => {
+  const boot = fresh()
+  // 「保留」 decomposed, as a Mac may hand it over; it must still count as one of the five.
+  const decomposed = '保留'.normalize('NFD')
+  const { $, created } = sidebar({ listed: JSON.stringify([{ id: 'g0', name: decomposed }]) })
+  expect(await boot($)).toEqual([])
+  expect(created).toEqual([])
+})
+
+test('a section whose name is blank or padded does not stand in for one of the five', async () => {
+  const boot = fresh()
+  const { $, created } = sidebar({ listed: JSON.stringify([{ id: 'g0', name: '  確認待ち  ' }]) })
+  expect(await boot($)).toEqual([])
+  expect(created).toEqual([])
+})
+
+test('a later session finishes the sections an earlier one was stopped partway through', async () => {
+  // The case the record exists for: two of the five stand, and the mod itself made them.
+  const boot = fresh()
+  const { $, created, store, logged } = sidebar({ existing: ['確認待ち', '作業中'], stored: ['確認待ち', '作業中'] })
+  expect(await boot($)).toEqual(['外部待ち', '保留', '完了'])
+  expect(created).toEqual(['外部待ち', '保留', '完了'])
+  expect(store.has('bootstrap.created')).toBe(false)
+  expect(logged.join(' ')).toContain('made all 3')
+})
+
+test('sections the mod did not make itself are never completed around', async () => {
+  // Two of the five stand but the record does not cover them: the person made or kept them, so the
+  // guard holds and nothing is created, exactly as before the bootstrap existed.
+  for (const stored of [undefined, ['確認待ち'] as readonly string[]]) {
+    const boot = fresh()
+    const { $, created } = sidebar({ existing: ['確認待ち', '作業中'], stored })
+    expect(await boot($)).toEqual([])
+    expect(created).toEqual([])
+  }
 })

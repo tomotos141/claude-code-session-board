@@ -61,7 +61,15 @@ export const sectionNames = (text: string): readonly string[] | undefined => {
     const parsed: unknown = JSON.parse(text)
     const rows = Array.isArray(parsed) ? parsed : (parsed as { sections?: unknown })?.sections
     if (!Array.isArray(rows)) return undefined
-    return rows.flatMap(r => (typeof (r as { name?: unknown })?.name === 'string' ? [(r as { name: string }).name] : []))
+    // Normalised, because a section typed on a Mac may arrive decomposed and would not match the five
+    // otherwise; the five would then be created beside it, which is the duplication the guard forbids.
+    const named = rows.flatMap(r => {
+      const n = (r as { name?: unknown })?.name
+      return typeof n === 'string' && n.trim() !== '' ? [n.normalize('NFC').trim()] : []
+    })
+    // Rows that are there but carry no readable name are the same "cannot tell": were the field ever to be
+    // spelled otherwise, every row would drop out and an occupied sidebar would read as an empty one.
+    return rows.length > 0 && named.length === 0 ? undefined : named
   } catch {
     return undefined
   }
@@ -73,31 +81,85 @@ export const sectionNames = (text: string): readonly string[] | undefined => {
 // Once any one exists the person's own naming is in play, and this does nothing for the rest of the session.
 let bootstrapped = false
 
-// Only for the tests, which exercise several sidebars in one load of the module.
+// Only for the tests, which exercise several sidebars in one load of the module. Not API.
 export const resetBootstrapForTests = (): void => {
   bootstrapped = false
 }
 
-// The sidebar's tools are the desktop app's own MCP tools, so they are not in the build's tool table and
-// tool.call is reached through its untyped overload.
-export const bootstrapSections = async ($: Pick<EngineInterface, 'tool'>): Promise<readonly string[]> => {
+// A result the call answered. The union's refusal arm carries `deny` and leaves `isError` undefined, so
+// reading isError alone takes a refusal for a success: `result` is the one field only an answer sets.
+const answered = (r: { result?: unknown; isError?: boolean; deny?: string }): boolean =>
+  r.deny === undefined && r.isError !== true && r.result !== undefined
+
+// The log is the only trace the bootstrap leaves: every way it can fail shows up to the person as "sessions
+// are named but never move", with nothing to say why, so what it did and why it stopped belongs on the record.
+const say = ($: Pick<EngineInterface, 'ui'>, text: string): void => {
+  void Promise.resolve($.ui.log(`session-board: ${text}`, { to: 'debug' })).catch(() => undefined)
+}
+
+// The sidebar's tools are the desktop app's own MCP tools: this build declares no types for them, so the
+// names, the `name` argument and the JSON shape read back are all measured against the app, not checked by
+// the compiler. Measured on Claude Code 2.1.295, 2026-10-15: list_sections answers a JSON array of
+// { id, kind, name, ... }, and create_section takes { name }.
+export const bootstrapSections = async ($: Pick<EngineInterface, 'tool' | 'store' | 'ui'>): Promise<readonly string[]> => {
   if (bootstrapped) return []
   bootstrapped = true
   // Outside the desktop app the sidebar's tools are not there at all; a call would merely be refused.
   const tools = new Set((await $.tool.list()).map(t => t.name))
   if (!tools.has(SECTIONS_TOOL) || !tools.has(CREATE_SECTION_TOOL)) return []
-  const listed = await $.tool.call({ tool: SECTIONS_TOOL } as never)
-  if (listed.isError === true || listed.text === undefined) return []
+  // Asked before anything is called: tool.check opens no dialog and runs nothing. Without it the mod's first
+  // act in a new session could be six approval dialogs the person never asked for, before the first prompt.
+  for (const tool of [SECTIONS_TOOL, CREATE_SECTION_TOOL]) {
+    const { decision } = await $.tool.check({ tool, input: { name: SECTIONS[0] } })
+    if (decision !== 'allow') {
+      say($, `${tool} is not allowed outright (${decision}); leaving the sidebar alone`)
+      return []
+    }
+  }
+  const listed = await $.tool.call({ tool: SECTIONS_TOOL })
+  if (!answered(listed) || listed.text === undefined) {
+    say($, 'could not read the sidebar; created nothing')
+    return []
+  }
   const names = sectionNames(listed.text)
-  if (names === undefined) return []
+  if (names === undefined) {
+    say($, 'could not make out which sections the sidebar has; created nothing')
+    return []
+  }
   const existing = new Set(names)
-  if (SECTIONS.some(s => existing.has(s))) return []
+  // What an earlier session of this mod created before it was stopped partway. Without it a run that stopped
+  // after two would be stuck: one of the five now stands, so the guard below would decline to make the rest,
+  // for good and in silence. The record only ever covers sections the mod made itself, so finishing the set
+  // still duplicates nothing of the person's.
+  const made = new Set(((await $.store.get('bootstrap.created')) as readonly string[] | undefined) ?? [])
+  const mine = SECTIONS.filter(s => existing.has(s)).every(s => made.has(s))
+  if (SECTIONS.some(s => existing.has(s)) && !mine) return []
+  const owing = SECTIONS.filter(s => !existing.has(s))
+  if (owing.length === 0) {
+    await $.store.delete('bootstrap.created')
+    return []
+  }
   const created: string[] = []
-  // In order, so the sidebar lays them out the way the rule reads them.
-  for (const name of SECTIONS) {
-    const r = await $.tool.call({ tool: CREATE_SECTION_TOOL, name } as never)
-    if (r.isError === true) break
-    created.push(name)
+  try {
+    // In order, so the sidebar lays them out the way the rule reads them.
+    for (const name of owing) {
+      const r = await $.tool.call({ tool: CREATE_SECTION_TOOL, name })
+      // A refusal answers on the union's deny arm, where isError is unset: stop at the first one rather than
+      // record it as made and ask four more times.
+      if (!answered(r)) {
+        say($, `${CREATE_SECTION_TOOL} did not answer for 「${name}」; made ${created.length} of ${owing.length}, the rest are owed to a later session`)
+        return created
+      }
+      created.push(name)
+    }
+  } finally {
+    // In a finally, because an aborted call rejects out of the loop and leaves the same half-built sidebar:
+    // either way what stands is written down, so a later session finishes the set instead of the guard above
+    // seeing one of the five and declining to create the rest for good.
+    const owed = created.length < owing.length
+    await $.store.set('bootstrap.created', [...made, ...created])
+    if (!owed && SECTIONS.every(s => existing.has(s) || created.includes(s))) await $.store.delete('bootstrap.created')
+    say($, owed ? `made ${created.length} of ${owing.length} sections; the rest are owed` : `made all ${owing.length} sections it was missing`)
   }
   return created
 }

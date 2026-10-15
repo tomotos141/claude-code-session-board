@@ -4,7 +4,7 @@ A Claude Code plugin for the desktop app. It asks Claude to name each session on
 
 A list of sessions then answers the only question a list of sessions needs to answer: which of these is waiting for me?
 
-The sidebar needs five sections, named `確認待ち` / `作業中` / `外部待ち` / `保留` / `完了`. **On the first session where not one of them exists, the plugin creates all five itself**, so there is nothing to set up. Where any of them is already there it creates none, and leaves the sidebar as you have arranged it. The rule it adds is written in Japanese.
+The sidebar needs five sections, named `確認待ち` / `作業中` / `外部待ち` / `保留` / `完了`. **If your sidebar has none of them, the plugin creates all five itself** and there is nothing to set up. If it already has some of them, the plugin creates none, and the ones you are missing are yours to add — it only ever moves a session to a section it finds under its exact name. The rule it adds is written in Japanese.
 
 ## Why the state is not in the name
 
@@ -24,15 +24,17 @@ So the two things are split by what they are. The **name** says which work it is
 
 The names are Japanese and fixed in the source; there is no setting for them. `外部待ち` ("waiting on the outside") is deliberately not `待ち`, which read too much like `確認待ち` at a glance.
 
-**The first session creates them**, and only then: the plugin asks the sidebar for its sections, and if not one of the five is there it creates all five, in the order above. If any one of them is there it creates none — including the case where you renamed one or kept only some.
+The plugin looks each section up by exact name, and **never creates one that is missing**. That is deliberate: if you rename `保留` to something of your own, it finds no `保留` and simply does not move the session there, rather than putting a second section beside yours. The cost is that a section you are missing is a section the plugin will never use, silently.
 
-After that it only ever looks them up, by exact name, and never creates one that is missing. That is deliberate: if you rename `保留` to something of your own, the plugin finds no `保留` and simply does not move the session there, rather than making a second section beside yours. The one-time creation holds to the same line — it runs only when there is nothing of yours to duplicate.
+The one exception is a sidebar with **none of the five**. At the start of each session the plugin reads the sections, and only in that case creates all five, in the order above. Nothing of yours can be duplicated when nothing of yours is there, so the rule above still holds.
+
+So: an untouched sidebar needs nothing from you. A sidebar where you have renamed or removed some of the five is yours to arrange — add back any you want the plugin to use, under these exact names.
 
 ## What it actually does
 
 - Adds one rule to Claude's system prompt: how to name the session, and which section matches which answer to "who moves next".
 - Keeps three tools at hand — `set_session_title`, `move_sessions`, `list_sections` — so none of them needs a tool search first, and repeats the relevant half of the rule in the rename and move tools' own descriptions. `list_sections` is only brought forward; its description is left alone.
-- At the start of a session, reads the sidebar's sections once; if not one of the five is there, creates all five. It is not waited on, and a sidebar that is slow, absent or refuses cannot hold up or fail the session's start. Outside the desktop app, where the sidebar's tools do not exist, it does nothing.
+- At the start of **every** session, reads the sidebar's sections once; if not one of the five is there, creates all five. So deleting all five and opening a new session brings them back. If a run is stopped or refused partway, it writes down which ones it made, and a later session finishes only those — it never completes a set around a section you made yourself. It asks for permission before calling anything, and stops quietly if either tool is not allowed outright, so it cannot greet you with a row of dialogs. It is not waited on, and a sidebar that is slow, absent or refuses cannot hold up or fail the session's start. Outside the desktop app, where the sidebar's tools do not exist, it does nothing.
 - Adds one line to the result of each successful [`overview`](https://github.com/tomotos141/claude-code-overview) update in the main conversation: if who-moves-next changed, move the session; if it did not, do nothing. Claude calls `overview` at each state change anyway, which is what makes this the right moment to ask. A failed update, and one inside a subagent, are skipped.
 - Asks Claude to send one `PushNotification` line when, and only when, it moves the session to 確認待ち — so you learn what you are being asked, not merely that something moved.
 - Where the session has no rename tool, such as the terminal, the system-prompt rule is not added. The other two parts are not conditioned on it: a tool description still gains its line where that tool exists, and the reminder is still appended after an `overview` update.
@@ -48,7 +50,7 @@ claude plugin marketplace add tomotos141/claude-code-session-board
 claude plugin install session-board@claude-code-session-board
 ```
 
-Then start a new session. The five sections appear on their own if your sidebar has none of them; if it already has some, create the rest yourself under those exact names — a section missing under its exact name means Claude will name sessions but never move them there, and nothing will say why.
+Then start a new session. If your sidebar has none of the five, they appear on their own. If it already has some, add the rest yourself under those exact names: Claude will name sessions but never move them to a section it cannot find, and nothing will say why.
 
 `overview` is not required: without it the rule still applies, and only the reminder after each update is missing.
 
@@ -71,7 +73,7 @@ Claude Code デスクトップアプリ向けの plugin です。セッション
 
 セッションの一覧が、一覧として答えるべき唯一の問いに答えるようになります。このうちどれが自分の返事を待っているのか。
 
-サイドバーには `確認待ち` / `作業中` / `外部待ち` / `保留` / `完了` の5つのセクションが要ります。**5つのどれも無いセッションでは、plugin が5つまとめて作ります**。入れるだけで動きます。どれか1つでもあるときは作らず、あなたが並べたサイドバーをそのままにします。
+サイドバーには `確認待ち` / `作業中` / `外部待ち` / `保留` / `完了` の5つのセクションが要ります。**サイドバーに5つのどれも無ければ、plugin が5つまとめて作ります**。そのときは入れるだけで動きます。すでにいくつかあるときは1つも作らないので、足りない分はご自分で足してください。plugin は名前の完全一致で見つけたセクションへしか移しません。
 
 ### 状態を名前に入れない理由
 
@@ -91,15 +93,17 @@ Claude Code デスクトップアプリ向けの plugin です。セッション
 
 セクション名は日本語でソースに固定してあり、設定で差し替える仕組みはありません。`待ち` ではなく `外部待ち` にしてあるのは、`確認待ち` と見分けづらかったためです。
 
-**最初のセッションが作ります**。ただし作るのはそのときだけです。plugin はサイドバーのセクションを訊き、5つのどれも無ければ上の順に5つ作ります。どれか1つでもあれば1つも作りません。名前を変えたときも、一部だけ残したときも同じです。
+plugin はセクションを名前の完全一致で引き、**無いセクションは作りません**。これは意図した線です。`保留` をご自分の名前に変えたなら、plugin は `保留` を見つけられず、そこへ移さないだけで済みます。あなたのセクションの隣に同じ意味のものを作ったりしません。代わりに、足りないセクションは plugin が使わないまま黙って残ります。
 
-そのあとは名前の完全一致で引くだけで、無いセクションは作りません。これは意図した線です。`保留` をご自分の名前に変えたなら、plugin は `保留` を見つけられず、そこへ移さないだけで済みます。あなたのセクションの隣に同じ意味のものを作ったりしません。初回の作成も同じ線の内側にあります。壊す相手が1つも無いときだけ走るからです。
+例外は、5つのどれも無いサイドバーだけです。plugin はセッションのはじめにセクションを読み、そのときだけ上の順に5つ作ります。あなたのものが1つも無ければ重複させる相手もいないので、上の線はそのまま保たれます。
+
+まとめると、手を付けていないサイドバーには何も要りません。5つのうちいくつかを変えたり消したりしたサイドバーは、あなたの管理です。plugin に使わせたいセクションは、この名前どおりに足してください。
 
 ### 実際にしていること
 
 - Claude の system prompt にルールを1つ足す。名前の付け方と、「次に動くのは誰か」の答えがどのセクションに対応するか。
 - `set_session_title`・`move_sessions`・`list_sections` の3つを手前に置き、ツール検索を先にしなくても使えるようにする。名前を変えるツールと移すツールの説明には、該当部分のルールも書き足す。`list_sections` は手前に置くだけで、説明はそのままです。
-- セッション開始時にサイドバーのセクションを1度読み、5つのどれも無ければ5つ作る。待ち合わせはしないので、サイドバーが遅くても、無くても、拒んでも、セッションの開始を止めたり失敗させたりしません。サイドバーのツールが無いデスクトップアプリの外では何もしません。
+- **毎回**のセッション開始時にサイドバーのセクションを1度読み、5つのどれも無ければ5つ作る。5つ全部を消して新しいセッションを開けば、また現れます。途中で止められたり拒まれたりしたときは作った分を書き留め、あとのセッションがその残りだけを作ります。ご自分で作ったセクションの周りを埋めることはしません。呼ぶ前に許可を確かめ、どちらかのツールが許可されていなければ静かにやめるので、開いたとたんに確認が並ぶことはありません。待ち合わせはしないので、サイドバーが遅くても、無くても、拒んでも、セッションの開始を止めたり失敗させたりしません。サイドバーのツールが無いデスクトップアプリの外では何もしません。
 - [`overview`](https://github.com/tomotos141/claude-code-overview) の更新が成功したとき、その結果に1行足す。次に動くのが誰かが変わったなら移す、変わっていなければ何もしない。Claude は状態が変わるたびに `overview` を呼ぶので、そこが訊くべき瞬間になります。失敗した更新と、サブエージェント内の更新は対象外です。
 - 確認待ちへ移したときだけ `PushNotification` を1行送らせる。何かが動いたことではなく、何に答えればよいかが届くようにするためです。
 - 名前を変えるツールが無いセッション（ターミナルなど）では、system prompt のルールを足しません。残り2つはこれに連動しないので、そのツールがあれば説明への書き足しは起き、`overview` 更新後のひと押しも付きます。
@@ -115,7 +119,7 @@ claude plugin marketplace add tomotos141/claude-code-session-board
 claude plugin install session-board@claude-code-session-board
 ```
 
-そのあと新しいセッションを開いてください。サイドバーに5つのどれも無ければ、5つは自然に現れます。すでにいくつかあるときは、残りをこの名前どおりにご自分で作ってください。この名前どおりに無いセクションへは、名前は付くのに移動だけが起きず、理由もどこにも出ません。
+そのあと新しいセッションを開いてください。サイドバーに5つのどれも無ければ、5つは自然に現れます。すでにいくつかあるときは、残りをこの名前どおりにご自分で足してください。見つけられないセクションへは、名前は付くのに移動だけが起きず、理由もどこにも出ません。
 
 `overview` は必須ではありません。無くてもルールは効き、更新後のひと押しだけが無くなります。
 
