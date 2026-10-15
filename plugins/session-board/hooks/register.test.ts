@@ -84,17 +84,20 @@ test('other results, failed updates and subagent updates carry no reminder', asy
   expect(await reminders($, session, row(OVERVIEW, false, 'a1'))).toEqual([])
 })
 
-// A stand-in for the sidebar: what list_sections answers, the create calls it records, the store the
-// bootstrap carries unfinished work in, and the debug lines it leaves.
+// A stand-in for the sidebar: what list_sections answers, the create calls it records, and how it answers
+// each - allowed or not, refused, failed, or never returning.
 const sidebar = (opts: {
   existing?: readonly string[]
   listed?: string
   listFails?: boolean
   listDenied?: boolean
   createFails?: boolean
+  createFailsAt?: number
   createDenied?: boolean
   createThrowsAt?: number
   without?: readonly string[]
+  decision?: string
+  decisionFor?: string
 } = {}) => {
   const created: string[] = []
   const tools = [SECTIONS_TOOL, CREATE_SECTION_TOOL].filter(t => !(opts.without ?? []).includes(t))
@@ -103,6 +106,10 @@ const sidebar = (opts: {
   const $ = {
     tool: {
       list: async () => tools.map(name => ({ name })),
+      // A rule may match on the arguments, so the double answers per name, as the real check does.
+      check: async (i: { tool: string; input?: { name?: string } }) => ({
+        decision: opts.decisionFor !== undefined && opts.decisionFor === i.input?.name ? 'deny' : (opts.decision ?? 'allow'),
+      }),
       call: async (input: { tool: string; name?: string }) => {
         if (input.tool === SECTIONS_TOOL) {
           if (opts.listDenied === true) return { deny: 'refused' }
@@ -113,7 +120,7 @@ const sidebar = (opts: {
         if (opts.createThrowsAt === creates) throw new Error('the call was aborted')
         // A refusal carries `deny` and leaves isError unset: taking that for a success is the bug this covers.
         if (opts.createDenied === true) return { deny: 'the user said no' }
-        if (opts.createFails === true) return { isError: true, result: 'refused' }
+        if (opts.createFails === true || opts.createFailsAt === creates) return { isError: true, result: 'refused' }
         created.push(input.name ?? '')
         return { result: { id: 'new' }, text: '{"id":"new"}' }
       },
@@ -268,12 +275,14 @@ test('a creation stopped partway stays stopped, and the next session does not fi
   expect(second.calls()).toBe(0)
 })
 
-test('a creation refused partway keeps what it made and asks for no more', async () => {
+test('a creation that fails partway keeps what it made and asks for no more', async () => {
+  // The error arm, failing on the third of the five rather than the first: the two already made are the
+  // answer, and no fourth call goes out. This is the shape the README describes to the person.
   const boot = fresh()
-  const { $, created, calls } = sidebar({ existing: [], createFails: true })
-  expect(await boot($)).toEqual([])
-  expect(created).toEqual([])
-  expect(calls()).toBe(1)
+  const { $, created, calls } = sidebar({ existing: [], createFailsAt: 3 })
+  expect(await boot($)).toEqual(['確認待ち', '作業中'])
+  expect(created).toEqual(['確認待ち', '作業中'])
+  expect(calls()).toBe(3)
 })
 
 test('a section typed in another normal form is not duplicated', async () => {
@@ -285,10 +294,40 @@ test('a section typed in another normal form is not duplicated', async () => {
   expect(created).toEqual([])
 })
 
-test('a section whose name is blank or padded does not stand in for one of the five', async () => {
+test('a padded name is still that section, so the five are not created beside it', async () => {
+  // Trimmed, so 「保留」 with spaces around it IS one of the five standing, and the run declines.
   const boot = fresh()
-  // A padded 「保留」 is that section; a blank name is no section at all and must not read as one.
   const { $, created } = sidebar({ listed: JSON.stringify([{ id: 'g0', name: '  保留  ' }, { id: 'g1', name: 'x' }]) })
   expect(await boot($)).toEqual([])
   expect(created).toEqual([])
+})
+
+test('a row with no readable name is no section, and does not stop the five', async () => {
+  // The case the previous test's name used to claim and never built. A blank or whitespace-only name is
+  // dropped from the listing; alongside a readable row it leaves a sidebar with none of the five, so the
+  // five are created. Nothing is duplicated, because a nameless row is not one of them.
+  for (const blank of ['', '   ']) {
+    const boot = fresh()
+    const { $, created } = sidebar({ listed: JSON.stringify([{ id: 'g0', name: blank }, { id: 'g1', name: 'x' }]) })
+    expect(await boot($)).toEqual([...SECTIONS])
+    expect(created).toEqual([...SECTIONS])
+  }
+})
+
+test('nothing is called at all when any one of the six would be asked', async () => {
+  // An allow for 確認待ち is not an allow for 完了. Checked before the first call, so a person who would
+  // dismiss the last dialog is never asked the first - and never left with a half-built sidebar.
+  const boot = fresh()
+  const { $, created, calls } = sidebar({ existing: [], decisionFor: '完了' })
+  expect(await boot($)).toEqual([])
+  expect(created).toEqual([])
+  expect(calls()).toBe(0)
+})
+
+test('where the sidebar tools are not allowed outright, nothing is called', async () => {
+  const boot = fresh()
+  const { $, created, calls } = sidebar({ existing: [], decision: 'ask' })
+  expect(await boot($)).toEqual([])
+  expect(created).toEqual([])
+  expect(calls()).toBe(0)
 })
