@@ -84,26 +84,42 @@ test('other results, failed updates and subagent updates carry no reminder', asy
   expect(await reminders($, session, row(OVERVIEW, false, 'a1'))).toEqual([])
 })
 
-// A stand-in for the sidebar: what list_sections answers, the create calls it records, the store the
-// bootstrap carries unfinished work in, and the debug lines it leaves.
+// A stand-in for the sidebar: what list_sections answers, the create calls it records, and how it answers
+// each - allowed or not, refused, failed, or never returning.
 const sidebar = (opts: {
   existing?: readonly string[]
   listed?: string
   listFails?: boolean
   listDenied?: boolean
-  createFails?: boolean
+  createFailsAt?: number
   createDenied?: boolean
+  createDeniedAt?: number
   createThrowsAt?: number
   without?: readonly string[]
+  decision?: string
+  decisionFor?: string
 } = {}) => {
   const created: string[] = []
   const tools = [SECTIONS_TOOL, CREATE_SECTION_TOOL].filter(t => !(opts.without ?? []).includes(t))
   const text = opts.listed ?? JSON.stringify((opts.existing ?? []).map((name, i) => ({ id: `g${i}`, kind: 'manual', name })))
   let creates = 0
+  // Recorded, not just answered: how many checks go out and in what order is the whole point of asking before
+  // the existence gate rather than after it, and a double that only counts calls cannot see that. Checks and
+  // calls share one log, because the orderings that matter run across the two - the listing is checked before
+  // it is read, and every name is checked before the first section is made.
+  const log: { kind: 'check' | 'call'; tool: string; name?: string }[] = []
   const $ = {
     tool: {
       list: async () => tools.map(name => ({ name })),
+      // A rule may match on the arguments, so the double answers per name, as the real check does.
+      check: async (i: { tool: string; input?: { name?: string } }) => {
+        log.push({ kind: 'check', tool: i.tool, ...(i.input?.name === undefined ? {} : { name: i.input.name }) })
+        return {
+          decision: opts.decisionFor !== undefined && opts.decisionFor === i.input?.name ? 'deny' : (opts.decision ?? 'allow'),
+        }
+      },
       call: async (input: { tool: string; name?: string }) => {
+        log.push({ kind: 'call', tool: input.tool, ...(input.name === undefined ? {} : { name: input.name }) })
         if (input.tool === SECTIONS_TOOL) {
           if (opts.listDenied === true) return { deny: 'refused' }
           return opts.listFails === true ? { isError: true, result: 'no' } : { result: { text }, text }
@@ -112,14 +128,14 @@ const sidebar = (opts: {
         creates += 1
         if (opts.createThrowsAt === creates) throw new Error('the call was aborted')
         // A refusal carries `deny` and leaves isError unset: taking that for a success is the bug this covers.
-        if (opts.createDenied === true) return { deny: 'the user said no' }
-        if (opts.createFails === true) return { isError: true, result: 'refused' }
+        if (opts.createDenied === true || opts.createDeniedAt === creates) return { deny: 'the user said no' }
+        if (opts.createFailsAt === creates) return { isError: true, result: 'refused' }
         created.push(input.name ?? '')
         return { result: { id: 'new' }, text: '{"id":"new"}' }
       },
     },
   }
-  return { $: $ as never, created, calls: () => creates }
+  return { $: $ as never, created, calls: () => creates, log }
 }
 
 // bootstrapSections remembers that it ran for the life of the module, so each case clears that first.
@@ -176,9 +192,10 @@ test('a listing that fails creates nothing', async () => {
   expect(created).toEqual([])
 })
 
-test('a refused creation stops there instead of carrying on', async () => {
+test('a creation that fails stops there instead of carrying on', async () => {
+  // The error arm (isError), not the deny arm; the refusal arm is its own test below.
   const boot = fresh()
-  const { $, created } = sidebar({ existing: [], createFails: true })
+  const { $, created } = sidebar({ existing: [], createFailsAt: 1 })
   expect(await boot($)).toEqual([])
   expect(created).toEqual([])
 })
@@ -268,12 +285,14 @@ test('a creation stopped partway stays stopped, and the next session does not fi
   expect(second.calls()).toBe(0)
 })
 
-test('a creation refused partway keeps what it made and asks for no more', async () => {
+test('a creation that fails partway keeps what it made and asks for no more', async () => {
+  // The error arm, failing on the third of the five rather than the first: the two already made are the
+  // answer, and no fourth call goes out. This is the shape the README describes to the person.
   const boot = fresh()
-  const { $, created, calls } = sidebar({ existing: [], createFails: true })
-  expect(await boot($)).toEqual([])
-  expect(created).toEqual([])
-  expect(calls()).toBe(1)
+  const { $, created, calls } = sidebar({ existing: [], createFailsAt: 3 })
+  expect(await boot($)).toEqual(['確認待ち', '作業中'])
+  expect(created).toEqual(['確認待ち', '作業中'])
+  expect(calls()).toBe(3)
 })
 
 test('a section typed in another normal form is not duplicated', async () => {
@@ -285,10 +304,85 @@ test('a section typed in another normal form is not duplicated', async () => {
   expect(created).toEqual([])
 })
 
-test('a section whose name is blank or padded does not stand in for one of the five', async () => {
+test('a padded name is still that section, so the five are not created beside it', async () => {
+  // Trimmed, so 「保留」 with spaces around it IS one of the five standing, and the run declines.
   const boot = fresh()
-  // A padded 「保留」 is that section; a blank name is no section at all and must not read as one.
   const { $, created } = sidebar({ listed: JSON.stringify([{ id: 'g0', name: '  保留  ' }, { id: 'g1', name: 'x' }]) })
   expect(await boot($)).toEqual([])
   expect(created).toEqual([])
+})
+
+test('a row with no readable name is no section, and does not stop the five', async () => {
+  // The case the previous test's name used to claim and never built. A blank or whitespace-only name is
+  // dropped from the listing; alongside a readable row it leaves a sidebar with none of the five, so the
+  // five are created. Nothing is duplicated, because a nameless row is not one of them.
+  for (const blank of ['', '   ']) {
+    const boot = fresh()
+    const { $, created } = sidebar({ listed: JSON.stringify([{ id: 'g0', name: blank }, { id: 'g1', name: 'x' }]) })
+    expect(await boot($)).toEqual([...SECTIONS])
+    expect(created).toEqual([...SECTIONS])
+  }
+})
+
+test('nothing is called at all when any one of the six would be asked', async () => {
+  // An allow for 確認待ち is not an allow for 完了. Checked before the first call, so a person who would
+  // dismiss the last dialog is never asked the first - and never left with a half-built sidebar.
+  const boot = fresh()
+  const { $, created, calls } = sidebar({ existing: [], decisionFor: '完了' })
+  expect(await boot($)).toEqual([])
+  expect(created).toEqual([])
+  expect(calls()).toBe(0)
+})
+
+test('where the sidebar tools are not allowed outright, nothing is called', async () => {
+  const boot = fresh()
+  const { $, created, calls } = sidebar({ existing: [], decision: 'ask' })
+  expect(await boot($)).toEqual([])
+  expect(created).toEqual([])
+  expect(calls()).toBe(0)
+})
+
+test('a sidebar that already has one of the five is asked about once, not six times', async () => {
+  // The five name-checks sit after the existence gate, so the common case - the sections are already there -
+  // costs one check and the listing, and nothing else. Hoisting them up beside the listing check would group
+  // the six neatly and cost five needless permission queries at every session start; this notices that.
+  const boot = fresh()
+  const { $, created, calls, log } = sidebar({ existing: ['完了'] })
+  expect(await boot($)).toEqual([])
+  expect(created).toEqual([])
+  // calls() counts creations alone, and a sidebar that has one of the five is created nothing, by the rule.
+  expect(calls()).toBe(0)
+  // Strictly, so a check that carried no name differs from one that carried undefined.
+  expect(log).toStrictEqual([
+    { kind: 'check', tool: SECTIONS_TOOL },
+    { kind: 'call', tool: SECTIONS_TOOL },
+  ])
+})
+
+test('on an empty sidebar every check precedes the thing it is about', async () => {
+  // The whole sequence, checks and calls in one log: the listing is checked before it is read, and all five
+  // names are checked before the first section is made - an allow for one is not an allow for the rest.
+  const boot = fresh()
+  const { $, log } = sidebar({ existing: [] })
+  expect(await boot($)).toEqual([...SECTIONS])
+  expect(log).toStrictEqual([
+    { kind: 'check', tool: SECTIONS_TOOL },
+    { kind: 'call', tool: SECTIONS_TOOL },
+    ...SECTIONS.map(name => ({ kind: 'check' as const, tool: CREATE_SECTION_TOOL, name })),
+    ...SECTIONS.map(name => ({ kind: 'call' as const, tool: CREATE_SECTION_TOOL, name })),
+  ])
+})
+
+test('an allow from the preflight is not a promise, so a late refusal can still leave some standing', async () => {
+  // The preflight covers rules and modes; per the engine's contract it asks no PreToolUse hook and no
+  // auto-mode classifier, while each real call is decided with them. So all six can be allowed here and the
+  // third create refused anyway. Two sections stand, and the rule declines to complete the set for good.
+  // What this pins is the handling - a late refusal is kept, not completed around. The cause is out of reach
+  // in a double, where check and call are independent knobs; the engine's contract is the evidence for that.
+  // It is here so nobody reads the preflight as making this state impossible and treats the check as binding.
+  const boot = fresh()
+  const { $, created, calls } = sidebar({ existing: [], createDeniedAt: 3 })
+  expect(await boot($)).toEqual(['確認待ち', '作業中'])
+  expect(created).toEqual(['確認待ち', '作業中'])
+  expect(calls()).toBe(3)
 })

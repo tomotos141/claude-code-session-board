@@ -1,6 +1,6 @@
 {
   "name": "session-board",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Names the session once and keeps it in the sidebar section for whoever moves next",
   "author": { "name": "tomotos141" },
   "homepage": "https://github.com/tomotos141/claude-code-session-board",

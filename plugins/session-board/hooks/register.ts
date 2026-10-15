@@ -108,6 +108,20 @@ export const bootstrapSections = async ($: Pick<EngineInterface, 'tool'>): Promi
   // Outside the desktop app the sidebar's tools are not there at all; a call would merely be refused.
   const tools = new Set((await $.tool.list()).map(t => t.name))
   if (!tools.has(SECTIONS_TOOL) || !tools.has(CREATE_SECTION_TOOL)) return []
+  // Asked before anything is called: tool.check opens no dialog and runs nothing. This is about the number of
+  // dialogs, not about any state the mod keeps - without it the mod's first act in a new session could be six
+  // approval dialogs the person never asked for, before their first prompt. Each call is checked with the
+  // arguments it will actually carry, since a rule may match on them.
+  //
+  // It closes the declarative path to a half-built sidebar - settings rules, the permission mode, another
+  // plugin's tool.check hook - and no more than that. Per the engine's own contract tool.check asks no
+  // PreToolUse hook and no auto-mode classifier, while each real call is decided with them, so an allow here
+  // is not a promise that the call will not be refused. A refusal on the third create still leaves two
+  // sections standing, which the rule above then declines to complete, for good. That is the documented
+  // trade - a run stopped partway stays stopped - and the preflight makes it rarer, not impossible.
+  const allowed = async (tool: string, input: Record<string, unknown>): Promise<boolean> =>
+    (await $.tool.check({ tool, input })).decision === 'allow'
+  if (!(await allowed(SECTIONS_TOOL, {}))) return []
   const listed = await $.tool.call({ tool: SECTIONS_TOOL })
   if (!answered(listed) || listed.text === undefined) return []
   const names = sectionNames(listed.text)
@@ -116,10 +130,15 @@ export const bootstrapSections = async ($: Pick<EngineInterface, 'tool'>): Promi
   if (names === undefined) return []
   const existing = new Set(names)
   if (SECTIONS.some(s => existing.has(s))) return []
+  // Every name it is about to create, before it creates the first: an allow for one of them is not an allow
+  // for the rest.
+  for (const name of SECTIONS) if (!(await allowed(CREATE_SECTION_TOOL, { name }))) return []
   const created: string[] = []
   // In order, so the sidebar lays them out the way the rule reads them. A call that does not answer - refused,
   // failed, or never returned - stops the run where it stands: there is no retry and no later resume.
   for (const name of SECTIONS) {
+    // Flat beside the tool here; tool.check above nests the same arguments under `input`. Both are the shapes
+    // the engine declares, and they do disagree on their face - do not make one look like the other.
     const r = await $.tool.call({ tool: CREATE_SECTION_TOOL, name })
     if (!answered(r)) return created
     created.push(name)
