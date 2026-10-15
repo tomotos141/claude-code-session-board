@@ -96,24 +96,40 @@ const sidebar = (opts: {
   createThrowsAt?: number
   without?: readonly string[]
   decision?: string
-  stored?: readonly string[]
+  decisionFor?: string
+  stored?: unknown
+  storeFails?: boolean
+  logThrows?: boolean
 } = {}) => {
   const created: string[] = []
   const logged: string[] = []
   const store = new Map<string, unknown>(opts.stored === undefined ? [] : [['bootstrap.created', opts.stored]])
+  const writes: unknown[] = []
   const tools = [SECTIONS_TOOL, CREATE_SECTION_TOOL].filter(t => !(opts.without ?? []).includes(t))
   const text = opts.listed ?? JSON.stringify((opts.existing ?? []).map((name, i) => ({ id: `g${i}`, kind: 'manual', name })))
   let creates = 0
   const $ = {
-    ui: { log: async (line: string) => void logged.push(line) },
+    ui: {
+      log: (line: string) => {
+        if (opts.logThrows === true) throw new Error('nowhere to log')
+        logged.push(line)
+      },
+    },
     store: {
       get: async (k: string) => store.get(k),
-      set: async (k: string, v: unknown) => void store.set(k, v),
+      set: async (k: string, v: unknown) => {
+        if (opts.storeFails === true) throw new Error('the store is full')
+        writes.push(v)
+        store.set(k, v)
+      },
       delete: async (k: string) => void store.delete(k),
     },
     tool: {
       list: async () => tools.map(name => ({ name })),
-      check: async () => ({ decision: opts.decision ?? 'allow' }),
+      check: async (i: { tool: string; input?: { name?: string } }) => ({
+        decision: opts.decisionFor !== undefined && opts.decisionFor === i.input?.name ? 'deny' : (opts.decision ?? 'allow'),
+        checked: i,
+      }),
       call: async (input: { tool: string; name?: string }) => {
         if (input.tool === SECTIONS_TOOL) {
           if (opts.listDenied === true) return { deny: 'refused' }
@@ -130,7 +146,7 @@ const sidebar = (opts: {
       },
     },
   }
-  return { $: $ as never, created, logged, store, calls: () => creates }
+  return { $: $ as never, created, logged, store, writes, calls: () => creates }
 }
 
 // bootstrapSections remembers that it ran for the life of the module, so each case clears that first.
@@ -337,4 +353,92 @@ test('sections the mod did not make itself are never completed around', async ()
     expect(await boot($)).toEqual([])
     expect(created).toEqual([])
   }
+})
+
+test('a section renamed between sessions is not recreated beside the name the person chose', async () => {
+  // The record says the mod made 確認待ち and 作業中; the person has since renamed 作業中 to one of their own.
+  // Only 確認待ち is still one of the five, and it IS in the record, so a one-directional check would call
+  // this a resume and create 作業中 beside their Doing. The record has to agree in both directions.
+  const boot = fresh()
+  const { $, created, store, logged } = sidebar({ existing: ['確認待ち', 'Doing'], stored: ['確認待ち', '作業中'] })
+  expect(await boot($)).toEqual([])
+  expect(created).toEqual([])
+  // Theirs now, so the stale record goes rather than being acted on again.
+  expect(store.has('bootstrap.created')).toBe(false)
+  expect(logged.join(' ')).toContain('not the ones standing now')
+})
+
+test('a section deleted between sessions is not recreated either', async () => {
+  const boot = fresh()
+  const { $, created } = sidebar({ existing: ['確認待ち'], stored: ['確認待ち', '作業中'] })
+  expect(await boot($)).toEqual([])
+  expect(created).toEqual([])
+})
+
+test('a hand-edited record is read as no record rather than acted on or thrown over', async () => {
+  // A bare string would become a Set of its characters; a number or an object throws on `new Set`, and that
+  // throw would leave through the swallowed catch and kill the bootstrap for the session with no trace.
+  for (const stored of ['確認待ち', 5, true, { a: 1 }, null]) {
+    const boot = fresh()
+    const { $, created, logged } = sidebar({ existing: ['確認待ち'], stored })
+    expect(await boot($)).toEqual([])
+    expect(created).toEqual([])
+    expect(logged.join(' ')).toContain('not readable')
+  }
+})
+
+test('junk entries inside the record are dropped, and the rest still resumes', async () => {
+  const boot = fresh()
+  const { $, created } = sidebar({ existing: ['確認待ち'], stored: ['確認待ち', 42, null, { x: 1 }] })
+  expect(await boot($)).toEqual(['作業中', '外部待ち', '保留', '完了'])
+  expect(created).toEqual(['作業中', '外部待ち', '保留', '完了'])
+})
+
+test('what it writes down is deduplicated, never a growing list', async () => {
+  const boot = fresh()
+  const { $, store, writes } = sidebar({ existing: [], stored: ['確認待ち'], createFails: true })
+  await boot($)
+  // Nothing was made this run, so the record is what it was, written once and without a repeat.
+  expect(store.get('bootstrap.created')).toEqual(['確認待ち'])
+  for (const w of writes) expect((w as readonly string[]).length).toBe(new Set(w as readonly string[]).size)
+})
+
+test('a store that cannot be written loses neither the result nor the session', async () => {
+  // A partial run is the case that writes: the finally must not replace the loop's own answer, or the
+  // refusal's return, with the store's exception.
+  const boot = fresh()
+  const { $, created, logged } = sidebar({ existing: [], storeFails: true, createFails: true })
+  expect(await boot($)).toEqual([])
+  expect(created).toEqual([])
+  expect(logged.join(' ')).toContain('could not write down')
+})
+
+test('a complete run whose record cannot be cleared still answers with what it made', async () => {
+  const boot = fresh()
+  const { $, created } = sidebar({ existing: [], storeFails: true })
+  expect((await boot($)).length).toBe(5)
+  expect(created.length).toBe(5)
+})
+
+test('a store that cannot be written does not swallow a real failure either', async () => {
+  const boot = fresh()
+  const { $ } = sidebar({ existing: [], storeFails: true, createThrowsAt: 2 })
+  // The abort's own cause must come out, not the store's.
+  await expect(boot($)).rejects.toThrow('aborted')
+})
+
+test('logging that throws cannot break the bootstrap', async () => {
+  const boot = fresh()
+  const { $, created } = sidebar({ existing: [], logThrows: true })
+  expect((await boot($)).length).toBe(5)
+  expect(created.length).toBe(5)
+})
+
+test('each name it will create is checked, not just the first', async () => {
+  // An allow for 確認待ち is not an allow for 完了; stopping halfway is what leaves a half-built sidebar.
+  const boot = fresh()
+  const { $, created, calls } = sidebar({ existing: [], decisionFor: '完了' })
+  expect(await boot($)).toEqual([])
+  expect(created).toEqual([])
+  expect(calls()).toBe(0)
 })
