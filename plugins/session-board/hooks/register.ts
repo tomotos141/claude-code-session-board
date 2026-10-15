@@ -113,8 +113,16 @@ const recorded = async ($: Pick<EngineInterface, 'store' | 'ui'>): Promise<Reado
 const remember = ($: Pick<EngineInterface, 'store'>, names: readonly string[]): Promise<void> =>
   $.store.set(STORE_KEY, [...new Set(names.map(canonical))])
 
+// Guarded like the write in the finally below: a store that cannot be cleared must not take the caller's own
+// answer with it. A record left behind is simply read again next time, and the staleness check above is what
+// keeps that harmless.
 const forget = async ($: Pick<EngineInterface, 'store' | 'ui'>, why: string | undefined): Promise<void> => {
-  await $.store.delete(STORE_KEY)
+  try {
+    await $.store.delete(STORE_KEY)
+  } catch {
+    say($, 'could not clear the record of what it made; it will be read again next time')
+    return
+  }
   if (why !== undefined) say($, `forgot the record: ${why}`)
 }
 
@@ -166,17 +174,21 @@ export const bootstrapSections = async ($: Pick<EngineInterface, 'tool' | 'store
   // after two would be stuck: one of the five now stands, so the guard below would decline to make the rest,
   // for good and in silence.
   const made = await recorded($)
-  // The record must agree with the sidebar in BOTH directions before it licenses a resume: every one of the
-  // five now standing has to be the mod's own, AND every one the mod wrote down has to still be standing.
-  // Only the first half would take a record entry the person has since renamed or deleted for one that is
-  // still owed, and create it beside the name they chose, which is the duplication this design forbids.
-  const standing = SECTIONS.filter(s => existing.has(s))
-  const resumable = standing.every(s => made.has(s)) && [...made].every(s => existing.has(s))
-  if (standing.length > 0 && !resumable) {
+  // The record is only about the past, so before it licenses anything it has to still describe the present:
+  // every name the mod wrote down must still be standing. A record naming one that is gone has been
+  // overtaken - renamed or removed - and acting on it would create that name again beside the one the person
+  // chose. This is checked on its own, before anything else consults the record, because the state a rename
+  // leaves behind can have none of the five standing at all, and a check that only ran when one did would be
+  // skipped in exactly the case it exists for.
+  if ([...made].some(s => !existing.has(s))) {
     // Their sidebar now, not the mod's half-finished work: let the record go rather than act on it again.
-    if (made.size > 0) await forget($, 'the sections it had written down are not the ones standing now')
+    await forget($, 'the sections it had written down are not the ones standing now')
     return []
   }
+  // Now the record can be trusted, so it can say whose the standing sections are. Where any of the five
+  // stands and is not the mod's own, it is the person's to arrange, and the set is never completed around it.
+  const standing = SECTIONS.filter(s => existing.has(s))
+  if (standing.some(s => !made.has(s))) return []
   const owing = SECTIONS.filter(s => !existing.has(s))
   if (owing.length === 0) {
     await forget($, undefined)
@@ -206,9 +218,12 @@ export const bootstrapSections = async ($: Pick<EngineInterface, 'tool' | 'store
     // would discard a return, swallow an abort's real cause, and lose the record it is here to keep.
     const owed = created.length < owing.length
     try {
-      if (owed) await remember($, [...made, ...created])
+      // Only what is actually standing goes back in. An entry whose section is gone would rebuild the very
+      // claim the staleness check above exists to catch.
+      if (owed) await remember($, [...[...made].filter(s => existing.has(s)), ...created])
       else await forget($, undefined)
     } catch {
+      // Only remember can land here now: forget reports its own failure instead of throwing.
       say($, 'could not write down what it made; a later session will read the sidebar afresh')
     }
     say($, owed ? `made ${created.length} of ${owing.length} sections; the rest are owed` : `made all ${owing.length} sections it was missing`)

@@ -99,6 +99,7 @@ const sidebar = (opts: {
   decisionFor?: string
   stored?: unknown
   storeFails?: boolean
+  deleteFails?: boolean
   logThrows?: boolean
 } = {}) => {
   const created: string[] = []
@@ -122,7 +123,10 @@ const sidebar = (opts: {
         writes.push(v)
         store.set(k, v)
       },
-      delete: async (k: string) => void store.delete(k),
+      delete: async (k: string) => {
+        if (opts.deleteFails === true) throw new Error('the store is locked')
+        store.delete(k)
+      },
     },
     tool: {
       list: async () => tools.map(name => ({ name })),
@@ -310,12 +314,14 @@ test('where the tools are not allowed outright, nothing is called', async () => 
 })
 
 test('a finished bootstrap clears what it had owed and says so', async () => {
+  // Resuming from a record that still agrees with the sidebar: 確認待ち stands and is the mod's own, so the
+  // four it still owes are made and the record, now describing nothing outstanding, is cleared.
   const boot = fresh()
-  const { $, created, store, logged } = sidebar({ existing: [], stored: ['確認待ち'] })
-  expect((await boot($)).length).toBe(5)
-  expect(created.length).toBe(5)
+  const { $, created, store, logged } = sidebar({ existing: ['確認待ち'], stored: ['確認待ち'] })
+  expect((await boot($)).length).toBe(4)
+  expect(created.length).toBe(4)
   expect(store.has('bootstrap.created')).toBe(false)
-  expect(logged.join(' ')).toContain('made all 5')
+  expect(logged.join(' ')).toContain('made all 4')
 })
 
 test('a section typed in another normal form is not duplicated', async () => {
@@ -395,12 +401,24 @@ test('junk entries inside the record are dropped, and the rest still resumes', a
 })
 
 test('what it writes down is deduplicated, never a growing list', async () => {
+  // A record that still agrees with the sidebar: 確認待ち stands and the record says the mod made it. The run
+  // resumes, is refused at the first of the four it still owes, and writes the record back unchanged.
   const boot = fresh()
-  const { $, store, writes } = sidebar({ existing: [], stored: ['確認待ち'], createFails: true })
+  const { $, store, writes } = sidebar({ existing: ['確認待ち'], stored: ['確認待ち'], createFails: true })
   await boot($)
-  // Nothing was made this run, so the record is what it was, written once and without a repeat.
   expect(store.get('bootstrap.created')).toEqual(['確認待ち'])
   for (const w of writes) expect((w as readonly string[]).length).toBe(new Set(w as readonly string[]).size)
+})
+
+test('a record entry whose section is gone is not carried forward into the next record', async () => {
+  // 確認待ち stands and is the mod's; 作業中 was in the record but the person deleted it. Writing 作業中 back
+  // would rebuild the stale claim the staleness check is there to catch, and the next session would act on
+  // it. Only what is actually standing, plus what this run made, goes in.
+  const boot = fresh()
+  const { $, store } = sidebar({ existing: ['確認待ち'], stored: ['確認待ち'], createThrowsAt: 2 })
+  await expect(boot($)).rejects.toThrow('aborted')
+  // It made 作業中 before the abort, so that is in; nothing stale is.
+  expect(store.get('bootstrap.created')).toEqual(['確認待ち', '作業中'])
 })
 
 test('a store that cannot be written loses neither the result nor the session', async () => {
@@ -441,4 +459,34 @@ test('each name it will create is checked, not just the first', async () => {
   expect(await boot($)).toEqual([])
   expect(created).toEqual([])
   expect(calls()).toBe(0)
+})
+
+test('the only section it made, since renamed, does not bring the other four down on top of it', async () => {
+  // The hard case: the record names one section, the person has renamed it, so NONE of the five is standing.
+  // A staleness check that only ran when one of the five was standing would be skipped here and all five
+  // would be created beside the name they chose - the exact duplication this design exists to prevent.
+  const boot = fresh()
+  const { $, created, store, logged } = sidebar({ existing: ['Inbox'], stored: ['確認待ち'] })
+  expect(await boot($)).toEqual([])
+  expect(created).toEqual([])
+  expect(store.has('bootstrap.created')).toBe(false)
+  expect(logged.join(' ')).toContain('not the ones standing now')
+})
+
+test('the only section it made, since deleted, is not quietly made again', async () => {
+  // Deleting it is a decision as much as renaming it is. The sidebar is empty of the five either way, and
+  // the record is the only thing that can tell the difference from a sidebar nobody has touched.
+  const boot = fresh()
+  const { $, created } = sidebar({ existing: [], stored: ['確認待ち'] })
+  expect(await boot($)).toEqual([])
+  expect(created).toEqual([])
+})
+
+test('a store that cannot be cleared loses neither the result nor the session', async () => {
+  // The completion path clears the record. If the clear throws, the five it just made are still its answer.
+  const boot = fresh()
+  const { $, created, logged } = sidebar({ existing: [], deleteFails: true })
+  expect((await boot($)).length).toBe(5)
+  expect(created.length).toBe(5)
+  expect(logged.join(' ')).toContain('could not clear the record')
 })
