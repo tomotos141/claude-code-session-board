@@ -137,6 +137,8 @@ export const bootstrapSections = async ($: Pick<EngineInterface, 'tool'>): Promi
   // In order, so the sidebar lays them out the way the rule reads them. A call that does not answer - refused,
   // failed, or never returned - stops the run where it stands: there is no retry and no later resume.
   for (const name of SECTIONS) {
+    // Flat beside the tool here; tool.check above nests the same arguments under `input`. Both are the shapes
+    // the engine declares, and they do disagree on their face - do not make one look like the other.
     const r = await $.tool.call({ tool: CREATE_SECTION_TOOL, name })
     if (!answered(r)) return created
     created.push(name)

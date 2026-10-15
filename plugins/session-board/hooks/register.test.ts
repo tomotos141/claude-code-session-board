@@ -103,13 +103,19 @@ const sidebar = (opts: {
   const tools = [SECTIONS_TOOL, CREATE_SECTION_TOOL].filter(t => !(opts.without ?? []).includes(t))
   const text = opts.listed ?? JSON.stringify((opts.existing ?? []).map((name, i) => ({ id: `g${i}`, kind: 'manual', name })))
   let creates = 0
+  // Recorded, not just answered: how many checks go out and in what order is the whole point of asking before
+  // the existence gate rather than after it, and a double that only counts calls cannot see that.
+  const checked: { tool: string; name?: string }[] = []
   const $ = {
     tool: {
       list: async () => tools.map(name => ({ name })),
       // A rule may match on the arguments, so the double answers per name, as the real check does.
-      check: async (i: { tool: string; input?: { name?: string } }) => ({
-        decision: opts.decisionFor !== undefined && opts.decisionFor === i.input?.name ? 'deny' : (opts.decision ?? 'allow'),
-      }),
+      check: async (i: { tool: string; input?: { name?: string } }) => {
+        checked.push({ tool: i.tool, name: i.input?.name })
+        return {
+          decision: opts.decisionFor !== undefined && opts.decisionFor === i.input?.name ? 'deny' : (opts.decision ?? 'allow'),
+        }
+      },
       call: async (input: { tool: string; name?: string }) => {
         if (input.tool === SECTIONS_TOOL) {
           if (opts.listDenied === true) return { deny: 'refused' }
@@ -126,7 +132,7 @@ const sidebar = (opts: {
       },
     },
   }
-  return { $: $ as never, created, calls: () => creates }
+  return { $: $ as never, created, calls: () => creates, checked }
 }
 
 // bootstrapSections remembers that it ran for the life of the module, so each case clears that first.
@@ -333,11 +339,38 @@ test('where the sidebar tools are not allowed outright, nothing is called', asyn
   expect(calls()).toBe(0)
 })
 
+test('a sidebar that already has one of the five is asked about once, not six times', async () => {
+  // The five name-checks sit after the existence gate, so the common case - the sections are already there -
+  // costs one check and the listing, and nothing else. Hoisting them up beside the listing check would group
+  // the six neatly and cost five needless permission queries at every session start; this notices that.
+  const boot = fresh()
+  const { $, created, calls, checked } = sidebar({ existing: ['完了'] })
+  expect(await boot($)).toEqual([])
+  expect(created).toEqual([])
+  // calls() counts creations alone, and a sidebar that has one of the five is created nothing, by the rule.
+  expect(calls()).toBe(0)
+  expect(checked).toEqual([{ tool: SECTIONS_TOOL, name: undefined }])
+})
+
+test('on an empty sidebar all six are checked, the listing first and then the five by name', async () => {
+  // Every name before the first creation, in the order they are created: an allow for one is not an allow for
+  // the rest, and the listing has to be checked before it is read.
+  const boot = fresh()
+  const { $, checked } = sidebar({ existing: [] })
+  expect(await boot($)).toEqual([...SECTIONS])
+  expect(checked).toEqual([
+    { tool: SECTIONS_TOOL, name: undefined },
+    ...SECTIONS.map(name => ({ tool: CREATE_SECTION_TOOL, name })),
+  ])
+})
+
 test('an allow from the preflight is not a promise, so a late refusal can still leave some standing', async () => {
   // The preflight covers rules and modes; per the engine's contract it asks no PreToolUse hook and no
   // auto-mode classifier, while each real call is decided with them. So all six can be allowed here and the
   // third create refused anyway. Two sections stand, and the rule declines to complete the set for good.
-  // This is the documented trade, pinned so nobody reads the preflight as making it impossible.
+  // What this pins is the handling - a late refusal is kept, not completed around. The cause is out of reach
+  // in a double, where check and call are independent knobs; the engine's contract is the evidence for that.
+  // It is here so nobody reads the preflight as making this state impossible and treats the check as binding.
   const boot = fresh()
   const { $, created, calls } = sidebar({ existing: [], createDeniedAt: 3 })
   expect(await boot($)).toEqual(['確認待ち', '作業中'])
